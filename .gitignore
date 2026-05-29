@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+embedded_chunks/
+tmp*/
+tmp*
+
+# Virtual environments
+.venv
+#Local Environment
+.env
+
+*.out
+*.parquet
