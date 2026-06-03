@@ -12,20 +12,33 @@ dependencies = [
     "tqdm>=4.67.3",
     "transformers>=4.51.0",
     "python-dotenv>=1.0.0",
-    "gguf>=0.19.0",
 ]
 [project.optional-dependencies]
-nvidia = [
-    "torch==2.9.0",
-    "torchvision==0.24.0",
+rocm = [
+    "flash-attn==2.8.3",
+    "gguf>=0.19.0",
+    "torch==2.9.1",
     "torchaudio==2.9.0",
-    "flash-attn==2.8.3 ; sys_platform != 'win32'",
-    "triton==3.5.0 ; sys_platform != 'win32'",
+    "torchvision==0.24.0",
+    "triton==3.5.1 ; sys_platform != 'win32'",
 ]
 
-[tool.uv]
-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
-no-binary-package = ["flash-attn"]
-
 [tool.uv.extra-build-dependencies]
-flash-attn = ["torch==2.9.0"]
+flash-attn = ["torch"]
+
+[tool.uv.sources]
+flash-attn = [
+    { path = "/home/adrien/flash_attn-2.8.3-py3-none-any.whl", extra = "rocm" },
+]
+torch = [
+    { path = "/home/adrien/torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp312-cp312-linux_x86_64.whl", extra = "rocm" },
+]
+torchaudio = [
+    { path = "/home/adrien/torchaudio-2.9.0+rocm7.2.0.gite3c6ee2b-cp312-cp312-linux_x86_64.whl", extra = "rocm" },
+]
+torchvision = [
+    { path = "/home/adrien/torchvision-0.24.0+rocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl", extra = "rocm" },
+]
+triton = [
+    { path = "/home/adrien/triton-3.5.1+rocm7.2.0.gita272dfa8-cp312-cp312-linux_x86_64.whl", extra = "rocm" },
+]
