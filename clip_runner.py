@@ -1,4 +1,7 @@
+import json
 import os
+from collections import deque
+from contextlib import suppress
 from time import perf_counter
 
 # RDNA4 (gfx1200) can require an explicit override on ROCm so PyTorch builds
@@ -6,9 +9,7 @@ from time import perf_counter
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "12.0.0")
 
 import torch.nn.functional as F
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -29,22 +30,39 @@ from target_families import (
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
+
+
 # --- CONFIGURATION ---
-DATASET_PATH = "longclip_training_prompts.parquet"
-QWEN_CHECKPOINT = "embedded_chunks/checkpoint_latest.parquet"
-OUTPUT_DIR = "embedded_chunks"
-CLIP_CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "clip_checkpoint_latest.parquet")
+DATASET_PATH = _env_str(
+    "QWEN_DATASET_PATH",
+    _env_str("DATASET_PATH", "longclip_training_prompts.parquet"),
+)
+SOURCE_OUTPUT_DIR = _env_str(
+    "QWEN_OUTPUT_DIR",
+    _env_str("SOURCE_OUTPUT_DIR", "embedded_chunks"),
+)
+TARGET_OUTPUT_DIR = _env_str("TARGET_OUTPUT_DIR", "embedded_chunks")
+QWEN_CHECKPOINT = os.path.join(SOURCE_OUTPUT_DIR, "checkpoint_latest.parquet")
+CLIP_CHECKPOINT_PATH = os.path.join(TARGET_OUTPUT_DIR, "clip_checkpoint_latest.parquet")
 CLIP_CHECKPOINT_TMP = CLIP_CHECKPOINT_PATH + ".tmp"
-CLIP_ERRORS_PATH = os.path.join(OUTPUT_DIR, "clip_errors.parquet")
+CLIP_ERRORS_PATH = os.path.join(TARGET_OUTPUT_DIR, "clip_errors.parquet")
 CLIP_ERRORS_TMP = CLIP_ERRORS_PATH + ".tmp"
+SOURCE_MANIFEST_PATH = os.path.join(SOURCE_OUTPUT_DIR, "source_manifest.json")
 FINAL_OUTPUT = "longclip_training_prompts_with_embeddings.parquet"
 FINAL_OUTPUT_TMP = FINAL_OUTPUT + ".tmp"
-# Two-tier CLIP checkpoint: immutable compressed archives + small rolling delta.
-CLIP_ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "clip_archive")
+# Two-tier CLIP checkpoint: immutable archives + small rolling delta.
+CLIP_ARCHIVE_DIR = os.path.join(TARGET_OUTPUT_DIR, "clip_archive")
 CLIP_ARCHIVE_EVERY = int(os.getenv("CLIP_ARCHIVE_EVERY", "250000"))
-CLIP_CHECKPOINT_DELTA = os.path.join(OUTPUT_DIR, "clip_checkpoint_delta.parquet")
+CLIP_CHECKPOINT_DELTA = os.path.join(TARGET_OUTPUT_DIR, "clip_checkpoint_delta.parquet")
 CLIP_CHECKPOINT_DELTA_TMP = CLIP_CHECKPOINT_DELTA + ".tmp"
-SDXL_CLIP_ARCHIVE_EVERY = int(os.getenv("SDXL_CLIP_ARCHIVE_EVERY", "2048"))
+SDXL_CLIP_ARCHIVE_EVERY = int(os.getenv("SDXL_CLIP_ARCHIVE_EVERY", "0"))
 
 # LongCLIP-L: extends CLIP ViT-L/14 context from 77 to 248 tokens.
 # Public, no gating. Outputs 768-dim pooler_output.
@@ -54,12 +72,36 @@ SDXL_PROMPT_COLUMN = "prompt_embeds"
 SDXL_POOLED_COLUMN = "pooled_prompt_embeds"
 
 # Two-tier Qwen checkpoint locations (mirrors runner.py)
-ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "archive")
-CHECKPOINT_DELTA = os.path.join(OUTPUT_DIR, "checkpoint_delta.parquet")
+ARCHIVE_DIR = os.path.join(SOURCE_OUTPUT_DIR, "archive")
+CHECKPOINT_DELTA = os.path.join(SOURCE_OUTPUT_DIR, "checkpoint_delta.parquet")
 
-BATCH_SIZE = 512
+BATCH_SIZE = int(os.getenv("CLIP_BATCH_SIZE", "512"))
+CLIP_MAX_ROWS = int(os.getenv("CLIP_MAX_ROWS", "0"))
+TARGET_ARCHIVE_COMPRESS = os.getenv(
+    "TARGET_ARCHIVE_COMPRESS", "1"
+).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SDXL_TARGET_DTYPE = os.getenv("SDXL_TARGET_DTYPE", "float16").strip().lower()
+if SDXL_TARGET_DTYPE not in {"float16", "float32"}:
+    raise ValueError(
+        f"Unsupported SDXL_TARGET_DTYPE '{SDXL_TARGET_DTYPE}'. Expected float16 or float32."
+    )
+TARGET_ARCHIVE_WRITERS = max(0, int(os.getenv("TARGET_ARCHIVE_WRITERS", "7")))
+TARGET_ARCHIVE_MAX_INFLIGHT = max(
+    1,
+    int(
+        os.getenv(
+            "TARGET_ARCHIVE_MAX_INFLIGHT",
+            str(max(1, TARGET_ARCHIVE_WRITERS)),
+        )
+    ),
+)
 CHECKPOINT_EVERY = int(os.getenv("CLIP_CHECKPOINT_EVERY", "100000"))
-SDXL_CHECKPOINT_EVERY = int(os.getenv("SDXL_CHECKPOINT_EVERY", "2048"))
+SDXL_CHECKPOINT_EVERY = int(os.getenv("SDXL_CHECKPOINT_EVERY", "50000"))
 # Sequence lengths are rounded up to multiples of BUCKET_SIZE before the
 # forward pass.  This limits the number of distinct tensor shapes to at most
 # LONG_CLIP_MAX_LENGTH // BUCKET_SIZE, so ROCm only needs to JIT-compile
@@ -68,13 +110,90 @@ BUCKET_SIZE = 32
 # Number of batches to tokenize ahead of the inference loop.
 # Tokenization is CPU-light; keeping several batches ready means the
 # forward-pass thread never stalls waiting for input.
-PREFETCH = max(4, (os.cpu_count() or 4) // 2)
+DEFAULT_PREFETCH = (
+    2 if (os.cpu_count() or 4) <= 8 else max(4, (os.cpu_count() or 4) // 2)
+)
+PREFETCH = max(1, int(os.getenv("CLIP_PREFETCH", str(DEFAULT_PREFETCH))))
 # Env-gated timing instrumentation for diagnosis. Set CLIP_TIMING_BATCHES to a
 # positive number to log that many early batches, or -1 to log every batch.
 TIMING_BATCHES = int(os.getenv("CLIP_TIMING_BATCHES", "0"))
 TIMING_EVERY = max(1, int(os.getenv("CLIP_TIMING_EVERY", "1")))
+DEFAULT_PROMPT_COLUMN = "prompt"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SOURCE_OUTPUT_DIR, exist_ok=True)
+os.makedirs(TARGET_OUTPUT_DIR, exist_ok=True)
+
+
+def _requested_prompt_column() -> str:
+    prompt_column = os.getenv("PROMPT_COLUMN", DEFAULT_PROMPT_COLUMN).strip()
+    return prompt_column or DEFAULT_PROMPT_COLUMN
+
+
+def _resolve_prompt_column(df: pd.DataFrame, prompt_column: str | None = None) -> str:
+    prompt_column = prompt_column or _requested_prompt_column()
+    if prompt_column not in df.columns:
+        available = ", ".join(sorted(df.columns))
+        raise KeyError(
+            f"Prompt column '{prompt_column}' not found in {DATASET_PATH}. "
+            f"Available columns: {available}"
+        )
+    missing_values = int(df[prompt_column].isna().sum())
+    if missing_values > 0:
+        raise ValueError(
+            f"Prompt column '{prompt_column}' contains {missing_values:,} missing values."
+        )
+    return prompt_column
+
+
+def _validate_source_manifest(prompt_column: str) -> None:
+    if not os.path.exists(SOURCE_MANIFEST_PATH):
+        return
+    with open(SOURCE_MANIFEST_PATH, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    recorded_prompt_column = payload.get("prompt_column")
+    if recorded_prompt_column and recorded_prompt_column != prompt_column:
+        raise RuntimeError(
+            "Prompt contract mismatch between runner.py and clip_runner.py: "
+            f"source manifest recorded '{recorded_prompt_column}', "
+            f"but clip_runner.py is using '{prompt_column}'."
+        )
+
+    recorded_dataset_path = payload.get("dataset_path")
+    if recorded_dataset_path and recorded_dataset_path != DATASET_PATH:
+        raise RuntimeError(
+            "Dataset path mismatch between runner.py and clip_runner.py: "
+            f"source manifest recorded '{recorded_dataset_path}', "
+            f"but clip_runner.py is configured for '{DATASET_PATH}'."
+        )
+
+
+def _sdxl_target_numpy_dtype():
+    return np.float16 if SDXL_TARGET_DTYPE == "float16" else np.float32
+
+
+def _sdxl_target_torch_dtype():
+    return torch.float16 if SDXL_TARGET_DTYPE == "float16" else torch.float32
+
+
+def _target_archive_dtype_name(target_family: str) -> str:
+    if target_family == "sdxl":
+        return SDXL_TARGET_DTYPE
+    return "float32"
+
+
+def _log_gpu_runtime(device):
+    if device.type != "cuda":
+        return
+    if torch.version.hip is not None:
+        print(
+            "ROCm launch: "
+            f"HSA_OVERRIDE_GFX_VERSION={os.getenv('HSA_OVERRIDE_GFX_VERSION')}, "
+            f"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL={os.getenv('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL')}"
+        )
+        return
+    if torch.version.cuda is not None:
+        print(f"CUDA runtime: torch.version.cuda={torch.version.cuda}")
 
 
 # ==========================================
@@ -269,7 +388,9 @@ def _checkpoint_every(target_family: str) -> int:
 
 def _archive_every(target_family: str) -> int:
     if target_family == "sdxl":
-        return SDXL_CLIP_ARCHIVE_EVERY
+        if SDXL_CLIP_ARCHIVE_EVERY > 0:
+            return SDXL_CLIP_ARCHIVE_EVERY
+        return BATCH_SIZE
     return CLIP_ARCHIVE_EVERY
 
 
@@ -330,15 +451,176 @@ def _load_hf_component(component_cls, source: str, **kwargs):
 def _archive_payload_from_slice(slice_df: pd.DataFrame, target_family: str) -> dict:
     payload = {"indices": np.array(slice_df.index, dtype=np.int64)}
     if target_family == "sdxl":
-        payload["prompt_embeds"] = np.asarray(slice_df[SDXL_PROMPT_COLUMN].tolist())
+        payload["prompt_embeds"] = np.asarray(
+            slice_df[SDXL_PROMPT_COLUMN].tolist(),
+            dtype=_sdxl_target_numpy_dtype(),
+        )
         payload["pooled_prompt_embeds"] = np.asarray(
-            slice_df[SDXL_POOLED_COLUMN].tolist()
+            slice_df[SDXL_POOLED_COLUMN].tolist(),
+            dtype=_sdxl_target_numpy_dtype(),
         )
     else:
         payload["embeddings"] = np.asarray(
             slice_df["clip_embedding"].tolist(), dtype=np.float32
         )
     return payload
+
+
+def _write_npz_payload(target, **payload):
+    if TARGET_ARCHIVE_COMPRESS:
+        np.savez_compressed(target, **payload)
+        return
+    np.savez(target, **payload)
+
+
+def _write_npz_file(npz_path: str, payload: dict, tmp_path: str | None = None):
+    tmp_path = npz_path + ".tmp" if tmp_path is None else tmp_path
+    with open(tmp_path, "wb") as f:
+        _write_npz_payload(f, **payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, npz_path)
+
+
+def _remove_files(*paths: str):
+    for path in paths:
+        with suppress(FileNotFoundError):
+            os.remove(path)
+
+
+def _new_sdxl_payload_buffer() -> dict:
+    return {
+        "positions": deque(),
+        "indices": deque(),
+        "prompt_embeds": deque(),
+        "pooled_prompt_embeds": deque(),
+        "rows": 0,
+    }
+
+
+def _append_sdxl_payload_buffer(
+    buffer: dict,
+    positions: np.ndarray,
+    indices: np.ndarray,
+    prompt_embeds: np.ndarray,
+    pooled_prompt_embeds: np.ndarray,
+):
+    if len(indices) == 0:
+        return
+    buffer["positions"].append(positions)
+    buffer["indices"].append(indices)
+    buffer["prompt_embeds"].append(prompt_embeds)
+    buffer["pooled_prompt_embeds"].append(pooled_prompt_embeds)
+    buffer["rows"] += len(indices)
+
+
+def _merge_sdxl_payloads(payloads: list[dict]) -> dict | None:
+    if not payloads:
+        return None
+    if len(payloads) == 1:
+        return payloads[0]
+    return {
+        "indices": np.concatenate([payload["indices"] for payload in payloads], axis=0),
+        "prompt_embeds": np.concatenate(
+            [payload["prompt_embeds"] for payload in payloads], axis=0
+        ),
+        "pooled_prompt_embeds": np.concatenate(
+            [payload["pooled_prompt_embeds"] for payload in payloads], axis=0
+        ),
+    }
+
+
+def _snapshot_sdxl_payload_buffer(buffer: dict) -> dict | None:
+    if buffer["rows"] == 0:
+        return None
+    return {
+        "indices": np.concatenate(list(buffer["indices"]), axis=0),
+        "prompt_embeds": np.concatenate(list(buffer["prompt_embeds"]), axis=0),
+        "pooled_prompt_embeds": np.concatenate(
+            list(buffer["pooled_prompt_embeds"]), axis=0
+        ),
+    }
+
+
+def _pop_sdxl_payload_buffer(buffer: dict, last_pos: int) -> dict | None:
+    if buffer["rows"] == 0:
+        return None
+    payload_parts: list[dict] = []
+    while buffer["positions"]:
+        positions = buffer["positions"][0]
+        if positions[0] > last_pos:
+            break
+        indices = buffer["indices"][0]
+        prompt_embeds = buffer["prompt_embeds"][0]
+        pooled_prompt_embeds = buffer["pooled_prompt_embeds"][0]
+        take = int(np.searchsorted(positions, last_pos, side="right"))
+        if take <= 0:
+            break
+        payload_parts.append(
+            {
+                "indices": indices[:take],
+                "prompt_embeds": prompt_embeds[:take],
+                "pooled_prompt_embeds": pooled_prompt_embeds[:take],
+            }
+        )
+        if take == len(indices):
+            buffer["positions"].popleft()
+            buffer["indices"].popleft()
+            buffer["prompt_embeds"].popleft()
+            buffer["pooled_prompt_embeds"].popleft()
+        else:
+            buffer["positions"][0] = positions[take:]
+            buffer["indices"][0] = indices[take:]
+            buffer["prompt_embeds"][0] = prompt_embeds[take:]
+            buffer["pooled_prompt_embeds"][0] = pooled_prompt_embeds[take:]
+        buffer["rows"] -= take
+    return _merge_sdxl_payloads(payload_parts)
+
+
+def _sdxl_checkpoint_payload(
+    pending_archives: deque, pending_buffer: dict
+) -> dict | None:
+    payloads = [meta["payload"] for meta in pending_archives]
+    tail_payload = _snapshot_sdxl_payload_buffer(pending_buffer)
+    if tail_payload is not None:
+        payloads.append(tail_payload)
+    return _merge_sdxl_payloads(payloads)
+
+
+def _write_target_archive_payload(archive_path: str, payload: dict):
+    _write_npz_file(archive_path, payload)
+
+
+def _drain_completed_target_archives(
+    pending_archives: deque,
+    *,
+    block: bool = False,
+) -> int | None:
+    if not pending_archives:
+        return None
+    if block and not pending_archives[0]["future"].done():
+        pending_archives[0]["future"].result()
+
+    durable_max_pos = None
+    while pending_archives and pending_archives[0]["future"].done():
+        meta = pending_archives.popleft()
+        meta["future"].result()
+        print(
+            f"\nArchived {len(meta['payload']['indices']):,} SDXL target rows "
+            f"(pos {meta['first_pos']:,}–{meta['last_pos']:,}) → {os.path.basename(meta['archive_path'])}"
+        )
+        durable_max_pos = meta["last_pos"]
+    return durable_max_pos
+
+
+def _save_sdxl_checkpoint_payload(
+    payload: dict | None,
+    checkpoint_path: str,
+    checkpoint_tmp_path: str,
+):
+    if payload is None or len(payload["indices"]) == 0:
+        return
+    _write_npz_file(checkpoint_path, payload, checkpoint_tmp_path)
 
 
 def write_target_archive(
@@ -358,23 +640,15 @@ def write_target_archive(
         fname = _target_archive_filename(
             archive_dir, archive_prefix, first_pos, rows_done - 1
         )
-        tmp_base = os.path.join(archive_dir, "_tmp_target_archive")
-        np.savez_compressed(
-            tmp_base,
-            **_archive_payload_from_slice(slice_df, target_family),
+        _write_npz_file(
+            fname,
+            _archive_payload_from_slice(slice_df, target_family),
         )
-        with open(tmp_base + ".npz", "rb") as f:
-            os.fsync(f.fileno())
-        os.replace(tmp_base + ".npz", fname)
         print(
             f"\nArchived {len(slice_df):,} {target_family.upper()} target rows "
             f"(pos {first_pos:,}–{rows_done - 1:,}) → {os.path.basename(fname)}"
         )
-    for p in [checkpoint_delta_path, checkpoint_delta_tmp_path]:
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
+    _remove_files(checkpoint_delta_path, checkpoint_delta_tmp_path)
     return rows_done - 1
 
 
@@ -394,14 +668,11 @@ def save_target_checkpoint_delta(
     if len(ckpt_df) == 0:
         return
     if target_family == "sdxl":
-        with open(checkpoint_delta_tmp_path, "wb") as f:
-            np.savez_compressed(
-                f,
-                **_archive_payload_from_slice(ckpt_df, target_family),
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(checkpoint_delta_tmp_path, checkpoint_delta_path)
+        _write_npz_file(
+            checkpoint_delta_path,
+            _archive_payload_from_slice(ckpt_df, target_family),
+            checkpoint_delta_tmp_path,
+        )
         return
     ckpt_df.to_parquet(checkpoint_delta_tmp_path)
     with open(checkpoint_delta_tmp_path, "rb") as f:
@@ -435,6 +706,48 @@ def load_target_checkpoint_delta_rows(
         lambda x: x.tolist() if hasattr(x, "tolist") else x
     )
     return delta
+
+
+def promote_sdxl_checkpoint_delta_to_archive(
+    checkpoint_path: str,
+    checkpoint_tmp_path: str,
+    archive_dir: str,
+    archive_prefix: str,
+    archive_start_pos: int,
+) -> int:
+    os.makedirs(archive_dir, exist_ok=True)
+    with np.load(checkpoint_path, allow_pickle=False) as data:
+        indices = data["indices"].astype(np.int64, copy=False)
+        if len(indices) == 0:
+            for path in [checkpoint_path, checkpoint_tmp_path]:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            return archive_start_pos - 1
+
+        archive_last_pos = int(indices.max())
+        archive_path = _target_archive_filename(
+            archive_dir,
+            archive_prefix,
+            archive_start_pos,
+            archive_last_pos,
+        )
+        _write_npz_file(
+            archive_path,
+            {
+                "indices": indices,
+                "prompt_embeds": np.asarray(data["prompt_embeds"]),
+                "pooled_prompt_embeds": np.asarray(data["pooled_prompt_embeds"]),
+            },
+        )
+    _remove_files(checkpoint_path, checkpoint_tmp_path)
+
+    print(
+        "Promoted SDXL delta checkpoint to archive: "
+        f"{os.path.basename(archive_path)}"
+    )
+    return archive_last_pos
 
 
 def write_clip_archive(
@@ -529,12 +842,7 @@ def load_clip_model(target_family="sd"):
         print(
             f"Loading CLIP model '{target_spec.model_id or CLIP_MODEL_ID}' on {device_label} ({dtype})..."
         )
-    if device.type == "cuda":
-        print(
-            "ROCm launch: "
-            f"HSA_OVERRIDE_GFX_VERSION={os.getenv('HSA_OVERRIDE_GFX_VERSION')}, "
-            f"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL={os.getenv('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL')}"
-        )
+    _log_gpu_runtime(device)
     if target_family == "sdxl":
         tokenizer = (
             _load_hf_component(
@@ -692,9 +1000,11 @@ def encode_inputs(
                     pooled_prompt_embeds = first_output
                 else:
                     pooled_prompt_embeds = outputs_two.last_hidden_state[:, -1]
-            prompt_numpy = prompt_embeds.float().cpu().numpy()
-            pooled_numpy = pooled_prompt_embeds.float().cpu().numpy()
-            result = [(prompt_numpy[i], pooled_numpy[i]) for i in range(n_prompts)]
+            prompt_numpy = prompt_embeds.to(_sdxl_target_torch_dtype()).cpu().numpy()
+            pooled_numpy = (
+                pooled_prompt_embeds.to(_sdxl_target_torch_dtype()).cpu().numpy()
+            )
+            result = (prompt_numpy, pooled_numpy)
         else:
             # pooler_output: (batch, hidden_size) — projected [EOS] token, matches diffusers usage
             # .float() ensures float32 numpy arrays regardless of model dtype (float16 on GPU)
@@ -711,12 +1021,12 @@ def encode_inputs(
     except Exception as e:
         print(f"\nTarget encode failed: {e}")
         if collect_timing:
-            return [None] * n_prompts, {
+            return (None if target_family == "sdxl" else [None] * n_prompts), {
                 "copy_in_s": 0.0,
                 "forward_s": 0.0,
                 "copy_out_s": 0.0,
             }
-        return [None] * n_prompts
+        return None if target_family == "sdxl" else [None] * n_prompts
 
 
 # ==========================================
@@ -728,25 +1038,43 @@ def process_clip():
     target_family = get_target_family(
         os.getenv("CLIP_TARGET_FAMILY", os.getenv("TARGET_FAMILY", "sd"))
     )
+    prompt_column = _requested_prompt_column()
     checkpoint_every = _checkpoint_every(target_family)
     archive_every = _archive_every(target_family)
-    target_layout = get_target_layout(OUTPUT_DIR, target_family)
+    target_layout = get_target_layout(TARGET_OUTPUT_DIR, target_family)
     ensure_target_root(target_layout)
     write_target_manifest(
         target_layout.manifest_path,
         build_target_manifest(
             target_family,
-            dtype="float32",
+            dtype=_target_archive_dtype_name(target_family),
             shard_size=archive_every,
+            prompt_column=prompt_column,
         ),
     )
 
     active_target_paths = _resolve_active_target_paths(target_layout)
+    direct_disk_target_storage = target_family == "sdxl"
+    use_async_archive_writes = direct_disk_target_storage and TARGET_ARCHIVE_WRITERS > 0
     print(f"Target family: {target_family}")
+    print(f"Qwen source root: {SOURCE_OUTPUT_DIR}")
+    print(f"Target output root: {TARGET_OUTPUT_DIR}")
     if active_target_paths["using_legacy"]:
         print(f"Using legacy target storage: {active_target_paths['archive_dir']}")
     else:
         print(f"Using target storage: {active_target_paths['archive_dir']}")
+    if direct_disk_target_storage:
+        print("Archived SDXL targets will stay on disk during resume.")
+    print(
+        "Archive compression: "
+        f"{'enabled' if TARGET_ARCHIVE_COMPRESS else 'disabled'}"
+    )
+    print(f"Archive dtype: {_target_archive_dtype_name(target_family)}")
+    print(f"Batch size: {BATCH_SIZE:,} | tokenizer prefetch: {PREFETCH}")
+    if direct_disk_target_storage:
+        print(
+            f"Archive writers: {TARGET_ARCHIVE_WRITERS} | inflight archive limit: {TARGET_ARCHIVE_MAX_INFLIGHT}"
+        )
     print(
         f"Checkpoint every {checkpoint_every:,} rows | archive every {archive_every:,} rows"
     )
@@ -770,10 +1098,17 @@ def process_clip():
     del qwen_df
     df = prompts_df.loc[qwen_index].copy()
     del qwen_index, prompts_df
-    _initialize_target_columns(df, target_family)
+    if CLIP_MAX_ROWS > 0:
+        df = df.iloc[:CLIP_MAX_ROWS].copy()
+        print(f"Sample mode enabled: limiting CLIP run to {len(df):,} rows.")
+    prompt_column = _resolve_prompt_column(df, prompt_column)
+    _validate_source_manifest(prompt_column)
     target_columns = _target_columns(target_family)
+    if not direct_disk_target_storage:
+        _initialize_target_columns(df, target_family)
     total_rows = len(df)
     print(f"{total_rows:,} rows with Qwen embeddings available.")
+    print(f"Using prompt column: {prompt_column}")
 
     # --- Discard any stale CLIP delta .tmp from a previous crash ---
     if os.path.exists(active_target_paths["checkpoint_delta_tmp_path"]):
@@ -784,19 +1119,33 @@ def process_clip():
     clip_archive_max_pos = get_clip_archive_max_pos(active_target_paths["archives"])
     clip_delta_max_pos = -1
 
-    for archive_path in active_target_paths["archives"]:
-        arc_df = load_target_archive_rows(archive_path, target_family)
-        _merge_target_rows(df, arc_df, target_family)
-        del arc_df
+    if not direct_disk_target_storage:
+        for archive_path in active_target_paths["archives"]:
+            arc_df = load_target_archive_rows(archive_path, target_family)
+            _merge_target_rows(df, arc_df, target_family)
+            del arc_df
 
     if os.path.exists(active_target_paths["checkpoint_delta_path"]):
         try:
-            delta = load_target_checkpoint_delta_rows(
-                active_target_paths["checkpoint_delta_path"], target_family
-            )
-            _merge_target_rows(df, delta, target_family)
-            clip_delta_max_pos = int(delta.index.max())
-            del delta
+            if direct_disk_target_storage:
+                clip_archive_max_pos = promote_sdxl_checkpoint_delta_to_archive(
+                    active_target_paths["checkpoint_delta_path"],
+                    active_target_paths["checkpoint_delta_tmp_path"],
+                    active_target_paths["archive_dir"],
+                    active_target_paths["archive_prefix"],
+                    clip_archive_max_pos + 1,
+                )
+                active_target_paths["archives"] = _list_target_archives(
+                    active_target_paths["archive_dir"],
+                    active_target_paths["archive_prefix"],
+                )
+            else:
+                delta = load_target_checkpoint_delta_rows(
+                    active_target_paths["checkpoint_delta_path"], target_family
+                )
+                _merge_target_rows(df, delta, target_family)
+                clip_delta_max_pos = int(delta.index.max())
+                del delta
         except Exception as e:
             print(f"CLIP delta checkpoint corrupted ({e}), discarding.")
             os.remove(active_target_paths["checkpoint_delta_path"])
@@ -819,7 +1168,10 @@ def process_clip():
 
     last_saved_pos = max(clip_archive_max_pos, clip_delta_max_pos)
     if last_saved_pos >= 0:
-        start_i = ((last_saved_pos + 1) // BATCH_SIZE) * BATCH_SIZE
+        if direct_disk_target_storage:
+            start_i = last_saved_pos + 1
+        else:
+            start_i = ((last_saved_pos + 1) // BATCH_SIZE) * BATCH_SIZE
         print(
             f"Resuming from position {start_i:,} / {total_rows:,} "
             f"(archive up to {clip_archive_max_pos:,}, delta up to {clip_delta_max_pos:,})"
@@ -829,6 +1181,8 @@ def process_clip():
 
     if start_i >= total_rows:
         print("All rows already have CLIP embeddings!")
+        if direct_disk_target_storage:
+            return
         remaining_start = clip_archive_max_pos + 1
         if remaining_start < total_rows:
             try:
@@ -865,21 +1219,36 @@ def process_clip():
     # Tokenizers release the GIL during their C extensions, so real
     # parallelism is achieved without multiprocessing overhead.
     # ---------------------------------------------------------------
-    target_column_positions = {
-        column: df.columns.get_loc(column) for column in target_columns
-    }
-    _prompt_col = df.columns.get_loc("prompt")
+    target_column_positions = None
+    if not direct_disk_target_storage:
+        target_column_positions = {
+            column: df.columns.get_loc(column) for column in target_columns
+        }
+    _prompt_col = df.columns.get_loc(prompt_column)
+    writer_pool = (
+        ThreadPoolExecutor(max_workers=TARGET_ARCHIVE_WRITERS)
+        if use_async_archive_writes
+        else None
+    )
+    pending_archive_writes: deque = deque()
+    pending_sdxl_payload = (
+        _new_sdxl_payload_buffer() if direct_disk_target_storage else None
+    )
+    durable_archive_max_pos = clip_archive_max_pos
+    submitted_archive_max_pos = clip_archive_max_pos
 
     def _tokenize(pos):
         """Tokenize one batch; returns (pos, batch_slice, inputs)."""
         batch_slice = df.iloc[pos : pos + BATCH_SIZE]
-        prompts = batch_slice["prompt"].tolist()
+        prompts = batch_slice[prompt_column].tolist()
         inputs = tokenize_batch(prompts, tokenizer, target_family)
         return pos, batch_slice, inputs
 
     pbar = tqdm(total=total_rows - start_i, desc="CLIP Embeddings")
     i = start_i
+    rows_done = start_i
     batch_num = 0
+    completed_all_rows = False
     try:
         with ThreadPoolExecutor(max_workers=PREFETCH) as pool:
             # Seed the queue with the first PREFETCH futures
@@ -930,64 +1299,169 @@ def process_clip():
                     }
 
                 write_start = perf_counter()
-                for j, emb in enumerate(embeddings):
-                    if emb is not None:
-                        _store_target_value(
-                            df,
-                            i + j,
-                            emb,
-                            target_family,
-                            target_column_positions,
-                        )
+                batch_end = i + len(batch_slice)
+                if direct_disk_target_storage:
+                    batch_indices = df.index[i:batch_end].to_numpy(
+                        dtype=np.int64, copy=False
+                    )
+                    batch_positions = np.arange(i, batch_end, dtype=np.int64)
+                    if embeddings is None:
+                        for row_pos, original_index in enumerate(batch_indices):
+                            failed_rows[int(original_index)] = df.iat[
+                                i + row_pos, _prompt_col
+                            ]
                     else:
-                        failed_rows[int(df.index[i + j])] = df.iat[i + j, _prompt_col]
+                        prompt_batch, pooled_batch = embeddings
+                        _append_sdxl_payload_buffer(
+                            pending_sdxl_payload,
+                            batch_positions,
+                            batch_indices.copy(),
+                            prompt_batch,
+                            pooled_batch,
+                        )
+                else:
+                    for j, emb in enumerate(embeddings):
+                        if emb is not None:
+                            _store_target_value(
+                                df,
+                                i + j,
+                                emb,
+                                target_family,
+                                target_column_positions,
+                            )
+                        else:
+                            failed_rows[int(df.index[i + j])] = df.iat[
+                                i + j, _prompt_col
+                            ]
                 write_s = perf_counter() - write_start
 
                 pbar.update(len(batch_slice))
 
-                rows_done = min(i + len(batch_slice), total_rows)
+                rows_done = min(batch_end, total_rows)
                 ckpt_s = 0.0
                 archive_s = 0.0
-                if rows_done - (clip_archive_max_pos + 1) >= archive_every:
+                if direct_disk_target_storage:
                     try:
                         archive_start = perf_counter()
-                        archive_first_pos = clip_archive_max_pos + 1
-                        clip_archive_max_pos = write_target_archive(
-                            df,
-                            archive_first_pos,
-                            rows_done,
-                            active_target_paths["archive_dir"],
-                            active_target_paths["archive_prefix"],
-                            active_target_paths["checkpoint_delta_path"],
-                            active_target_paths["checkpoint_delta_tmp_path"],
-                            target_family,
+                        completed_pos = _drain_completed_target_archives(
+                            pending_archive_writes
                         )
-                        _clear_target_rows(
-                            df,
-                            archive_first_pos,
-                            clip_archive_max_pos + 1,
-                            target_family,
-                        )
+                        if completed_pos is not None:
+                            durable_archive_max_pos = completed_pos
+
+                        while (
+                            rows_done - (submitted_archive_max_pos + 1) >= archive_every
+                        ):
+                            archive_first_pos = submitted_archive_max_pos + 1
+                            archive_last_pos = archive_first_pos + archive_every - 1
+                            while (
+                                writer_pool is not None
+                                and len(pending_archive_writes)
+                                >= TARGET_ARCHIVE_MAX_INFLIGHT
+                            ):
+                                completed_pos = _drain_completed_target_archives(
+                                    pending_archive_writes,
+                                    block=True,
+                                )
+                                if completed_pos is not None:
+                                    durable_archive_max_pos = completed_pos
+                            payload = _pop_sdxl_payload_buffer(
+                                pending_sdxl_payload,
+                                archive_last_pos,
+                            )
+                            submitted_archive_max_pos = archive_last_pos
+                            if payload is None:
+                                durable_archive_max_pos = archive_last_pos
+                                continue
+                            archive_path = _target_archive_filename(
+                                active_target_paths["archive_dir"],
+                                active_target_paths["archive_prefix"],
+                                archive_first_pos,
+                                archive_last_pos,
+                            )
+                            if writer_pool is not None:
+                                future = writer_pool.submit(
+                                    _write_target_archive_payload,
+                                    archive_path,
+                                    payload,
+                                )
+                                pending_archive_writes.append(
+                                    {
+                                        "future": future,
+                                        "first_pos": archive_first_pos,
+                                        "last_pos": archive_last_pos,
+                                        "archive_path": archive_path,
+                                        "payload": payload,
+                                    }
+                                )
+                            else:
+                                _write_target_archive_payload(archive_path, payload)
+                                print(
+                                    f"\nArchived {len(payload['indices']):,} SDXL target rows "
+                                    f"(pos {archive_first_pos:,}–{archive_last_pos:,}) → {os.path.basename(archive_path)}"
+                                )
+                                durable_archive_max_pos = archive_last_pos
                         archive_s = perf_counter() - archive_start
                     except Exception as arc_err:
                         print(f"\nWARNING: CLIP archive failed: {arc_err}")
-                if rows_done % checkpoint_every < BATCH_SIZE:
-                    try:
-                        ckpt_start = perf_counter()
-                        save_target_checkpoint_delta(
-                            df,
-                            clip_archive_max_pos,
-                            rows_done,
-                            active_target_paths["checkpoint_delta_path"],
-                            active_target_paths["checkpoint_delta_tmp_path"],
-                            target_family,
-                        )
-                        ckpt_s = perf_counter() - ckpt_start
-                        print(
-                            f"\nCLIP checkpoint saved ({min(rows_done, total_rows):,} rows)"
-                        )
-                    except Exception as ckpt_err:
-                        print(f"\nWARNING: CLIP checkpoint failed: {ckpt_err}")
+                    if rows_done % checkpoint_every < BATCH_SIZE:
+                        try:
+                            ckpt_start = perf_counter()
+                            _save_sdxl_checkpoint_payload(
+                                _sdxl_checkpoint_payload(
+                                    pending_archive_writes,
+                                    pending_sdxl_payload,
+                                ),
+                                active_target_paths["checkpoint_delta_path"],
+                                active_target_paths["checkpoint_delta_tmp_path"],
+                            )
+                            ckpt_s = perf_counter() - ckpt_start
+                            print(
+                                f"\nCLIP checkpoint saved ({min(rows_done, total_rows):,} rows)"
+                            )
+                        except Exception as ckpt_err:
+                            print(f"\nWARNING: CLIP checkpoint failed: {ckpt_err}")
+                else:
+                    if rows_done - (clip_archive_max_pos + 1) >= archive_every:
+                        try:
+                            archive_start = perf_counter()
+                            archive_first_pos = clip_archive_max_pos + 1
+                            clip_archive_max_pos = write_target_archive(
+                                df,
+                                archive_first_pos,
+                                rows_done,
+                                active_target_paths["archive_dir"],
+                                active_target_paths["archive_prefix"],
+                                active_target_paths["checkpoint_delta_path"],
+                                active_target_paths["checkpoint_delta_tmp_path"],
+                                target_family,
+                            )
+                            _clear_target_rows(
+                                df,
+                                archive_first_pos,
+                                clip_archive_max_pos + 1,
+                                target_family,
+                            )
+                            archive_s = perf_counter() - archive_start
+                        except Exception as arc_err:
+                            print(f"\nWARNING: CLIP archive failed: {arc_err}")
+                    if rows_done % checkpoint_every < BATCH_SIZE:
+                        try:
+                            ckpt_start = perf_counter()
+                            save_target_checkpoint_delta(
+                                df,
+                                clip_archive_max_pos,
+                                rows_done,
+                                active_target_paths["checkpoint_delta_path"],
+                                active_target_paths["checkpoint_delta_tmp_path"],
+                                target_family,
+                            )
+                            ckpt_s = perf_counter() - ckpt_start
+                            print(
+                                f"\nCLIP checkpoint saved ({min(rows_done, total_rows):,} rows)"
+                            )
+                        except Exception as ckpt_err:
+                            print(f"\nWARNING: CLIP checkpoint failed: {ckpt_err}")
 
                 if log_timing:
                     batch_s = perf_counter() - batch_start
@@ -1001,48 +1475,151 @@ def process_clip():
                         f"rate={len(batch_slice) / batch_s:.2f}it/s"
                     )
 
+        completed_all_rows = True
+
     finally:
-        pbar.close()
-        save_target_errors(
-            failed_rows,
-            active_target_paths["errors_path"],
-            active_target_paths["errors_tmp_path"],
-        )
-        rows_done = min(i + BATCH_SIZE, total_rows)
-        if rows_done < total_rows:
-            try:
-                if rows_done - (clip_archive_max_pos + 1) >= archive_every:
-                    archive_first_pos = clip_archive_max_pos + 1
-                    clip_archive_max_pos = write_target_archive(
-                        df,
-                        archive_first_pos,
-                        rows_done,
-                        active_target_paths["archive_dir"],
-                        active_target_paths["archive_prefix"],
-                        active_target_paths["checkpoint_delta_path"],
-                        active_target_paths["checkpoint_delta_tmp_path"],
-                        target_family,
+        try:
+            pbar.close()
+            save_target_errors(
+                failed_rows,
+                active_target_paths["errors_path"],
+                active_target_paths["errors_tmp_path"],
+            )
+            if direct_disk_target_storage:
+                try:
+                    completed_pos = _drain_completed_target_archives(
+                        pending_archive_writes
                     )
-                    _clear_target_rows(
-                        df,
-                        archive_first_pos,
-                        clip_archive_max_pos + 1,
-                        target_family,
-                    )
-                save_target_checkpoint_delta(
-                    df,
-                    clip_archive_max_pos,
-                    rows_done,
-                    active_target_paths["checkpoint_delta_path"],
-                    active_target_paths["checkpoint_delta_tmp_path"],
-                    target_family,
-                )
-                print(
-                    f"\nCLIP progress saved at position {rows_done:,}. Re-run to resume."
-                )
-            except Exception as e:
-                print(f"\nWARNING: CLIP shutdown save failed: {e}")
-            return
+                    if completed_pos is not None:
+                        durable_archive_max_pos = completed_pos
+
+                    if completed_all_rows and rows_done >= total_rows:
+                        final_first_pos = submitted_archive_max_pos + 1
+                        final_last_pos = total_rows - 1
+                        if final_first_pos <= final_last_pos:
+                            while (
+                                writer_pool is not None
+                                and len(pending_archive_writes)
+                                >= TARGET_ARCHIVE_MAX_INFLIGHT
+                            ):
+                                completed_pos = _drain_completed_target_archives(
+                                    pending_archive_writes,
+                                    block=True,
+                                )
+                                if completed_pos is not None:
+                                    durable_archive_max_pos = completed_pos
+                            payload = _pop_sdxl_payload_buffer(
+                                pending_sdxl_payload,
+                                final_last_pos,
+                            )
+                            submitted_archive_max_pos = final_last_pos
+                            if payload is None:
+                                durable_archive_max_pos = final_last_pos
+                            else:
+                                archive_path = _target_archive_filename(
+                                    active_target_paths["archive_dir"],
+                                    active_target_paths["archive_prefix"],
+                                    final_first_pos,
+                                    final_last_pos,
+                                )
+                                if writer_pool is not None:
+                                    future = writer_pool.submit(
+                                        _write_target_archive_payload,
+                                        archive_path,
+                                        payload,
+                                    )
+                                    pending_archive_writes.append(
+                                        {
+                                            "future": future,
+                                            "first_pos": final_first_pos,
+                                            "last_pos": final_last_pos,
+                                            "archive_path": archive_path,
+                                            "payload": payload,
+                                        }
+                                    )
+                                else:
+                                    _write_target_archive_payload(archive_path, payload)
+                                    print(
+                                        f"\nArchived {len(payload['indices']):,} SDXL target rows "
+                                        f"(pos {final_first_pos:,}–{final_last_pos:,}) → {os.path.basename(archive_path)}"
+                                    )
+                                    durable_archive_max_pos = final_last_pos
+
+                        while pending_archive_writes:
+                            completed_pos = _drain_completed_target_archives(
+                                pending_archive_writes,
+                                block=True,
+                            )
+                            if completed_pos is not None:
+                                durable_archive_max_pos = completed_pos
+                        _remove_files(
+                            active_target_paths["checkpoint_delta_path"],
+                            active_target_paths["checkpoint_delta_tmp_path"],
+                        )
+                    else:
+                        checkpoint_payload = _sdxl_checkpoint_payload(
+                            pending_archive_writes,
+                            pending_sdxl_payload,
+                        )
+                        _save_sdxl_checkpoint_payload(
+                            checkpoint_payload,
+                            active_target_paths["checkpoint_delta_path"],
+                            active_target_paths["checkpoint_delta_tmp_path"],
+                        )
+                        print(
+                            f"\nCLIP progress saved at position {rows_done:,}. Re-run to resume."
+                        )
+                        return
+                except Exception as e:
+                    print(f"\nWARNING: CLIP shutdown save failed: {e}")
+                    return
+            else:
+                rows_done = min(i + BATCH_SIZE, total_rows)
+                if rows_done < total_rows:
+                    try:
+                        if rows_done - (clip_archive_max_pos + 1) >= archive_every:
+                            archive_first_pos = clip_archive_max_pos + 1
+                            clip_archive_max_pos = write_target_archive(
+                                df,
+                                archive_first_pos,
+                                rows_done,
+                                active_target_paths["archive_dir"],
+                                active_target_paths["archive_prefix"],
+                                active_target_paths["checkpoint_delta_path"],
+                                active_target_paths["checkpoint_delta_tmp_path"],
+                                target_family,
+                            )
+                            _clear_target_rows(
+                                df,
+                                archive_first_pos,
+                                clip_archive_max_pos + 1,
+                                target_family,
+                            )
+                        save_target_checkpoint_delta(
+                            df,
+                            clip_archive_max_pos,
+                            rows_done,
+                            active_target_paths["checkpoint_delta_path"],
+                            active_target_paths["checkpoint_delta_tmp_path"],
+                            target_family,
+                        )
+                        print(
+                            f"\nCLIP progress saved at position {rows_done:,}. Re-run to resume."
+                        )
+                    except Exception as e:
+                        print(f"\nWARNING: CLIP shutdown save failed: {e}")
+                    return
+        finally:
+            if writer_pool is not None:
+                writer_pool.shutdown(wait=True)
+
+    if direct_disk_target_storage:
+        print(f"\nPipeline complete! {total_rows:,} rows processed.")
+        if failed_rows:
+            print(
+                f"{len(failed_rows):,} rows failed — see {active_target_paths['errors_path']} to retry."
+            )
+        return
 
     # Write the final CLIP archive for any remaining unarchived rows
     remaining_start = clip_archive_max_pos + 1

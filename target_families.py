@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 SCHEMA_VERSION = 1
 DEFAULT_TARGET_FAMILY = "sdxl"
 SUPPORTED_TARGET_FAMILIES = ("sd", "sdxl")
+DEFAULT_SDXL_OUTPUT_DIR = "/scratch/llama-diffusion-projector"
 
 
 @dataclass(frozen=True)
@@ -87,10 +88,21 @@ def get_target_family_spec(family):
     return TARGET_FAMILY_SPECS[normalize_target_family(family)]
 
 
+def resolve_target_output_dir(output_dir, family):
+    family = normalize_target_family(family)
+    shared_override = os.getenv("TARGET_OUTPUT_DIR")
+    if shared_override:
+        return shared_override
+    if family == "sdxl":
+        return os.getenv("SDXL_TARGET_OUTPUT_DIR", DEFAULT_SDXL_OUTPUT_DIR)
+    return output_dir
+
+
 def get_target_layout(output_dir, family):
     family = normalize_target_family(family)
     spec = get_target_family_spec(family)
-    root_dir = os.path.join(output_dir, "targets", family)
+    resolved_output_dir = resolve_target_output_dir(output_dir, family)
+    root_dir = os.path.join(resolved_output_dir, "targets", family)
     checkpoint_delta_filename = "checkpoint_delta.parquet"
     checkpoint_delta_tmp_filename = "checkpoint_delta.parquet.tmp"
     if family == "sdxl":
@@ -118,7 +130,7 @@ def get_target_layout(output_dir, family):
         errors_tmp_path=os.path.join(root_dir, "errors.parquet.tmp"),
         manifest_path=os.path.join(root_dir, "manifest.json"),
         best_checkpoint_path=os.path.join(root_dir, f"qwen_{family}_projector_best.pt"),
-        gguf_path=os.path.join(output_dir, f"qwen_{family}_projector.gguf"),
+        gguf_path=os.path.join(resolved_output_dir, f"qwen_{family}_projector.gguf"),
         legacy_archive_dir=legacy_archive_dir,
         legacy_archive_prefix=legacy_archive_prefix,
         legacy_checkpoint_delta_path=legacy_checkpoint_delta_path,
@@ -130,7 +142,9 @@ def ensure_target_root(layout):
     os.makedirs(layout.archive_dir, exist_ok=True)
 
 
-def build_target_manifest(family, *, dtype="float32", shard_size=None):
+def build_target_manifest(
+    family, *, dtype="float32", shard_size=None, prompt_column=None
+):
     spec = get_target_family_spec(family)
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -139,6 +153,8 @@ def build_target_manifest(family, *, dtype="float32", shard_size=None):
         "dtype": dtype,
         "shard_size": shard_size,
     }
+    if prompt_column is not None:
+        payload["prompt_column"] = prompt_column
     payload.update(asdict(spec))
     return payload
 

@@ -8,27 +8,163 @@ import pandas as pd
 import os
 from tqdm.asyncio import tqdm
 
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
+
+
 # --- CONFIGURATION ---
 # IMPORTANT: Point this to the batch endpoint (/v1/embeddings) of your proxy!
-PROXY_URL = "https://gpu.adriens-apis.io/llm/v1/embeddings"
-DATASET_PATH = "longclip_training_prompts.parquet"
-OUTPUT_DIR = "embedded_chunks"
+PROXY_URL = _env_str(
+    "QWEN_PROXY_URL",
+    _env_str("PROXY_URL", "https://gpu.adriens-apis.io/llm/v1/embeddings"),
+)
+EMBEDDING_MODEL = _env_str("QWEN_EMBEDDING_MODEL", "qwen3.5")
+DATASET_PATH = _env_str(
+    "QWEN_DATASET_PATH",
+    _env_str("DATASET_PATH", "longclip_training_prompts.parquet"),
+)
+OUTPUT_DIR = _env_str(
+    "QWEN_OUTPUT_DIR",
+    _env_str("SOURCE_OUTPUT_DIR", "embedded_chunks"),
+)
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "checkpoint_latest.parquet")
 CHECKPOINT_TMP = CHECKPOINT_PATH + ".tmp"
 ERRORS_PATH = os.path.join(OUTPUT_DIR, "errors.parquet")
 ERRORS_TMP = ERRORS_PATH + ".tmp"
+SOURCE_MANIFEST_PATH = os.path.join(OUTPUT_DIR, "source_manifest.json")
+SOURCE_MANIFEST_TMP = SOURCE_MANIFEST_PATH + ".tmp"
 LOCK_FILE = os.path.join(OUTPUT_DIR, "runner.lock")
 # Two-tier checkpoint: immutable compressed archives + small rolling delta.
 # Archives are written once per ARCHIVE_EVERY rows and never re-written.
 # The delta covers only rows since the last archive, so writes stay fast.
 ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "archive")
-ARCHIVE_EVERY = 100_000  # compact once per this many rows
+ARCHIVE_EVERY = max(
+    1,
+    int(os.getenv("QWEN_ARCHIVE_EVERY", os.getenv("ARCHIVE_EVERY", "100000"))),
+)  # compact once per this many rows
 CHECKPOINT_DELTA = os.path.join(OUTPUT_DIR, "checkpoint_delta.parquet")
 CHECKPOINT_DELTA_TMP = CHECKPOINT_DELTA + ".tmp"
-BATCH_SIZE = 128
-CHECKPOINT_EVERY = 1024  # save delta every N rows
+BATCH_SIZE = max(1, int(os.getenv("QWEN_BATCH_SIZE", "128")))
+CHECKPOINT_EVERY = max(
+    1,
+    int(os.getenv("QWEN_CHECKPOINT_EVERY", "1024")),
+)  # save delta every N rows
+DEFAULT_PROMPT_COLUMN = "prompt"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def _normalize_qwen_embedding_row(row) -> np.ndarray:
+    embedding = np.asarray(row, dtype=np.float32)
+    if embedding.ndim not in {1, 2}:
+        raise ValueError(
+            f"Unsupported Qwen embedding rank {embedding.ndim}; expected 1D or 2D."
+        )
+    if embedding.shape[-1] <= 0:
+        raise ValueError("Qwen embeddings must have a positive hidden dimension.")
+    if embedding.ndim == 2 and embedding.shape[0] <= 0:
+        raise ValueError(
+            "Token-sequence Qwen embeddings must contain at least one token."
+        )
+    return embedding
+
+
+def _detect_qwen_embedding_format(rows) -> str | None:
+    for row in rows:
+        if row is None:
+            continue
+        return (
+            "token_sequence"
+            if _normalize_qwen_embedding_row(row).ndim == 2
+            else "vector"
+        )
+    return None
+
+
+def _build_qwen_archive_payload(rows) -> tuple[dict[str, np.ndarray], str]:
+    normalized_rows = [_normalize_qwen_embedding_row(row) for row in rows]
+    if not normalized_rows:
+        raise ValueError("Cannot build an archive payload from an empty Qwen slice.")
+
+    row_ndims = {row.ndim for row in normalized_rows}
+    if len(row_ndims) != 1:
+        raise ValueError(
+            "Mixed vector and token-sequence Qwen embeddings in one archive slice."
+        )
+
+    if normalized_rows[0].ndim == 1:
+        return {
+            "embeddings": np.stack(normalized_rows).astype(np.float32, copy=False)
+        }, "vector"
+
+    hidden_dims = {int(row.shape[1]) for row in normalized_rows}
+    if len(hidden_dims) != 1:
+        raise ValueError(
+            "Token-sequence Qwen embeddings in one archive slice disagree on hidden size."
+        )
+
+    sequence_lengths = np.asarray(
+        [row.shape[0] for row in normalized_rows], dtype=np.int32
+    )
+    token_offsets = np.empty(len(normalized_rows) + 1, dtype=np.int64)
+    token_offsets[0] = 0
+    np.cumsum(sequence_lengths, out=token_offsets[1:])
+    token_embeddings = np.concatenate(normalized_rows, axis=0).astype(
+        np.float32, copy=False
+    )
+    pooled_embeddings = np.stack(
+        [row.mean(axis=0, dtype=np.float32) for row in normalized_rows]
+    ).astype(np.float32, copy=False)
+    return {
+        "token_embeddings": token_embeddings,
+        "token_offsets": token_offsets,
+        "sequence_lengths": sequence_lengths,
+        "pooled_embeddings": pooled_embeddings,
+    }, "token_sequence"
+
+
+def _resolve_prompt_column(df: pd.DataFrame) -> str:
+    prompt_column = os.getenv("PROMPT_COLUMN", DEFAULT_PROMPT_COLUMN).strip()
+    if not prompt_column:
+        prompt_column = DEFAULT_PROMPT_COLUMN
+    if prompt_column not in df.columns:
+        available = ", ".join(sorted(df.columns))
+        raise KeyError(
+            f"Prompt column '{prompt_column}' not found in {DATASET_PATH}. "
+            f"Available columns: {available}"
+        )
+    missing_values = int(df[prompt_column].isna().sum())
+    if missing_values > 0:
+        raise ValueError(
+            f"Prompt column '{prompt_column}' contains {missing_values:,} missing values."
+        )
+    return prompt_column
+
+
+def _write_source_manifest(
+    prompt_column: str, embedding_format: str = "unknown"
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "dataset_path": DATASET_PATH,
+        "prompt_column": prompt_column,
+        "embedding_format": embedding_format,
+        "embedding_model": EMBEDDING_MODEL,
+        "proxy_url": PROXY_URL,
+        "output_dir": OUTPUT_DIR,
+        "archive_every": ARCHIVE_EVERY,
+    }
+    with open(SOURCE_MANIFEST_TMP, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(SOURCE_MANIFEST_TMP, SOURCE_MANIFEST_PATH)
 
 
 def acquire_lock():
@@ -97,16 +233,18 @@ def write_archive(df: pd.DataFrame, first_pos: int, rows_done: int) -> int:
     slice_df = df.iloc[first_pos:rows_done][["qwen_embedding"]].dropna()
     if len(slice_df) > 0:
         indices = np.array(slice_df.index, dtype=np.int64)
-        embeddings = np.array(slice_df["qwen_embedding"].tolist(), dtype=np.float32)
+        payload, embedding_format = _build_qwen_archive_payload(
+            slice_df["qwen_embedding"].tolist()
+        )
         fname = _archive_filename(first_pos, rows_done - 1)
         tmp_base = os.path.join(ARCHIVE_DIR, "_tmp_archive")  # numpy appends .npz
-        np.savez_compressed(tmp_base, indices=indices, embeddings=embeddings)
+        np.savez_compressed(tmp_base, indices=indices, **payload)
         with open(tmp_base + ".npz", "rb") as f:
             os.fsync(f.fileno())
         os.replace(tmp_base + ".npz", fname)
         print(
             f"\nArchived {len(slice_df):,} embeddings "
-            f"(pos {first_pos:,}–{rows_done - 1:,}) → {os.path.basename(fname)}"
+            f"(pos {first_pos:,}–{rows_done - 1:,}, format={embedding_format}) → {os.path.basename(fname)}"
         )
     # Clear delta: it is fully covered by the new archive
     for p in [CHECKPOINT_DELTA, CHECKPOINT_DELTA_TMP]:
@@ -195,7 +333,7 @@ async def fetch_batch_embeddings(session, batch_prompts):
 
     while pending:
         prompts = [p for _, p in pending]
-        payload = {"input": prompts, "model": "qwen3.5"}
+        payload = {"input": prompts, "model": EMBEDDING_MODEL}
 
         try:
             async with session.post(
@@ -240,9 +378,17 @@ async def process_dataset():
 
     acquire_lock()
     print("Loading dataset...")
+    print(f"Qwen output root: {OUTPUT_DIR}")
+    print(f"Qwen archive dir: {ARCHIVE_DIR}")
+    print(f"Qwen archive rows: {ARCHIVE_EVERY:,}")
+    print(f"Qwen proxy URL: {PROXY_URL}")
     df = pd.read_parquet(DATASET_PATH)
+    prompt_column = _resolve_prompt_column(df)
     total_rows = df.shape[0]
     df["qwen_embedding"] = None
+    print(f"Using prompt column: {prompt_column}")
+    recorded_embedding_format = "unknown"
+    _write_source_manifest(prompt_column, recorded_embedding_format)
 
     # ----------------------------------------------------------------
     # One-time migration: convert legacy checkpoint_latest.parquet → archives
@@ -330,13 +476,20 @@ async def process_dataset():
         i = start_i
         try:
             for i in range(start_i, total_rows, BATCH_SIZE):
-                batch_slice = df["prompt"].iloc[i : i + BATCH_SIZE].tolist()
+                batch_slice = df[prompt_column].iloc[i : i + BATCH_SIZE].tolist()
                 embeddings = await fetch_batch_embeddings(session, batch_slice)
 
                 if len(embeddings) == len(batch_slice):
                     df.loc[i : i + BATCH_SIZE - 1, "qwen_embedding"] = pd.array(
                         embeddings, dtype=object
                     )
+                    detected_format = _detect_qwen_embedding_format(embeddings)
+                    if (
+                        detected_format is not None
+                        and detected_format != recorded_embedding_format
+                    ):
+                        recorded_embedding_format = detected_format
+                        _write_source_manifest(prompt_column, recorded_embedding_format)
                     # Record any individual None embeddings within the batch
                     for offset, emb in enumerate(embeddings):
                         if emb is None:
