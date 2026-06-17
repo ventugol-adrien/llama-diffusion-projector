@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import os
 from tqdm.asyncio import tqdm
+from urllib.parse import urlparse
 
 
 def _env_str(name: str, default: str) -> str:
@@ -17,6 +18,16 @@ def _env_str(name: str, default: str) -> str:
     return value or default
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return int(default)
+    value = value.strip()
+    if not value:
+        return int(default)
+    return int(value)
+
+
 # --- CONFIGURATION ---
 # IMPORTANT: Point this to the batch endpoint (/v1/embeddings) of your proxy!
 PROXY_URL = _env_str(
@@ -24,6 +35,43 @@ PROXY_URL = _env_str(
     _env_str("PROXY_URL", "https://gpu.adriens-apis.io/llm/v1/embeddings"),
 )
 EMBEDDING_MODEL = _env_str("QWEN_EMBEDDING_MODEL", "qwen3.5")
+EMBEDDING_POOLING = os.getenv("QWEN_EMBEDDING_POOLING", "").strip()
+
+
+def _proxy_api_style() -> str:
+    value = _env_str("QWEN_PROXY_API_STYLE", "auto").strip().lower()
+    if value not in {"auto", "openai_batch", "native_single"}:
+        raise ValueError(
+            "QWEN_PROXY_API_STYLE must be one of: auto, openai_batch, native_single. "
+            f"Got '{value}'."
+        )
+    if value != "auto":
+        return value
+
+    path = urlparse(PROXY_URL).path.rstrip("/")
+    if path.endswith("/embedding"):
+        return "native_single"
+    return "openai_batch"
+
+
+def _expected_embedding_format() -> str:
+    value = _env_str("QWEN_EXPECT_EMBEDDING_FORMAT", "auto").strip().lower()
+    if value not in {"auto", "vector", "token_sequence"}:
+        raise ValueError(
+            "QWEN_EXPECT_EMBEDDING_FORMAT must be one of: auto, vector, token_sequence. "
+            f"Got '{value}'."
+        )
+    return value
+
+
+EXPECTED_EMBEDDING_FORMAT = _expected_embedding_format()
+PROXY_API_STYLE = _proxy_api_style()
+NATIVE_SINGLE_CONCURRENCY = max(1, _env_int("QWEN_SINGLE_REQUEST_CONCURRENCY", 8))
+NATIVE_SINGLE_RETRIES = max(0, _env_int("QWEN_SINGLE_REQUEST_RETRIES", 3))
+NATIVE_SINGLE_RETRY_BASE_SECONDS = max(
+    0.0, float(_env_str("QWEN_SINGLE_REQUEST_RETRY_BASE_SECONDS", "0.5"))
+)
+
 DATASET_PATH = _env_str(
     "QWEN_DATASET_PATH",
     _env_str("DATASET_PATH", "longclip_training_prompts.parquet"),
@@ -43,18 +91,43 @@ LOCK_FILE = os.path.join(OUTPUT_DIR, "runner.lock")
 # Archives are written once per ARCHIVE_EVERY rows and never re-written.
 # The delta covers only rows since the last archive, so writes stay fast.
 ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "archive")
+BATCH_SIZE = max(1, int(os.getenv("QWEN_BATCH_SIZE", "128")))
 ARCHIVE_EVERY = max(
     1,
-    int(os.getenv("QWEN_ARCHIVE_EVERY", os.getenv("ARCHIVE_EVERY", "100000"))),
-)  # compact once per this many rows
+    int(
+        os.getenv(
+            "QWEN_ARCHIVE_EVERY",
+            os.getenv("ARCHIVE_EVERY", str(25 * BATCH_SIZE)),
+        )
+    ),
+)  # compact once per 25 batches by default
 CHECKPOINT_DELTA = os.path.join(OUTPUT_DIR, "checkpoint_delta.parquet")
 CHECKPOINT_DELTA_TMP = CHECKPOINT_DELTA + ".tmp"
-BATCH_SIZE = max(1, int(os.getenv("QWEN_BATCH_SIZE", "128")))
 CHECKPOINT_EVERY = max(
     1,
-    int(os.getenv("QWEN_CHECKPOINT_EVERY", "1024")),
-)  # save delta every N rows
+    int(os.getenv("QWEN_CHECKPOINT_EVERY", str(25 * BATCH_SIZE))),
+)  # save delta every 25 batches by default
 DEFAULT_PROMPT_COLUMN = "prompt"
+
+
+def _load_qwen_embedding_extra_body() -> dict[str, object]:
+    raw = os.getenv("QWEN_EMBEDDING_EXTRA_BODY", "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "QWEN_EMBEDDING_EXTRA_BODY must be valid JSON."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "QWEN_EMBEDDING_EXTRA_BODY must decode to a JSON object."
+        )
+    return payload
+
+
+EMBEDDING_EXTRA_BODY = _load_qwen_embedding_extra_body()
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -117,14 +190,10 @@ def _build_qwen_archive_payload(rows) -> tuple[dict[str, np.ndarray], str]:
     token_embeddings = np.concatenate(normalized_rows, axis=0).astype(
         np.float32, copy=False
     )
-    pooled_embeddings = np.stack(
-        [row.mean(axis=0, dtype=np.float32) for row in normalized_rows]
-    ).astype(np.float32, copy=False)
     return {
         "token_embeddings": token_embeddings,
         "token_offsets": token_offsets,
         "sequence_lengths": sequence_lengths,
-        "pooled_embeddings": pooled_embeddings,
     }, "token_sequence"
 
 
@@ -154,10 +223,15 @@ def _write_source_manifest(
         "dataset_path": DATASET_PATH,
         "prompt_column": prompt_column,
         "embedding_format": embedding_format,
+        "expected_embedding_format": EXPECTED_EMBEDDING_FORMAT,
         "embedding_model": EMBEDDING_MODEL,
+        "embedding_pooling": EMBEDDING_POOLING or None,
+        "embedding_extra_body": EMBEDDING_EXTRA_BODY or None,
+        "proxy_api_style": PROXY_API_STYLE,
         "proxy_url": PROXY_URL,
         "output_dir": OUTPUT_DIR,
         "archive_every": ARCHIVE_EVERY,
+        "checkpoint_every": CHECKPOINT_EVERY,
     }
     with open(SOURCE_MANIFEST_TMP, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -246,6 +320,7 @@ def write_archive(df: pd.DataFrame, first_pos: int, rows_done: int) -> int:
             f"\nArchived {len(slice_df):,} embeddings "
             f"(pos {first_pos:,}–{rows_done - 1:,}, format={embedding_format}) → {os.path.basename(fname)}"
         )
+    df.loc[df.index[first_pos:rows_done], "qwen_embedding"] = None
     # Clear delta: it is fully covered by the new archive
     for p in [CHECKPOINT_DELTA, CHECKPOINT_DELTA_TMP]:
         try:
@@ -316,6 +391,68 @@ def _parse_bad_item_index(error_text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _print_proxy_contract_hint(error_text: str) -> None:
+    lowered = error_text.lower()
+    if "pooling type 'none' is not oai compatible" in lowered:
+        if PROXY_API_STYLE == "native_single":
+            print(
+                "  -> This /embedding proxy is still forwarding to an "
+                "OpenAI-compatible /v1/embeddings upstream. Point QWEN_PROXY_URL "
+                "directly at the native llama.cpp /embedding endpoint instead "
+                "(for example http://127.0.0.1:8080/embedding), or fix the proxy."
+            )
+        else:
+            print(
+                "  -> Upstream is configured for raw token embeddings, so the "
+                "OpenAI-compatible /v1/embeddings route cannot serve this request. "
+                "Point QWEN_PROXY_URL at a native /embedding endpoint instead."
+            )
+
+
+async def fetch_single_embedding(session, prompt):
+    payload = {"content": prompt, **EMBEDDING_EXTRA_BODY}
+    timeout = aiohttp.ClientTimeout(total=300.0)
+    for attempt in range(NATIVE_SINGLE_RETRIES + 1):
+        try:
+            async with session.post(PROXY_URL, json=payload, timeout=timeout) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, dict):
+                        return data.get("embedding")
+                    if isinstance(data, list) and data:
+                        first_item = data[0]
+                        if isinstance(first_item, dict):
+                            return first_item.get("embedding")
+                    raise RuntimeError(
+                        "Native /embedding response did not contain an embedding payload."
+                    )
+
+                error_text = await response.text()
+                print(f"\nProxy Error {response.status}: {error_text}")
+                _print_proxy_contract_hint(error_text)
+                return None
+        except (
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientOSError,
+            asyncio.TimeoutError,
+        ) as e:
+            if attempt >= NATIVE_SINGLE_RETRIES:
+                print(f"\nSingle request failed: {e}")
+                return None
+            retry_delay = NATIVE_SINGLE_RETRY_BASE_SECONDS * (2**attempt)
+            print(
+                f"\nSingle request transient failure: {e} "
+                f"(retry {attempt + 1}/{NATIVE_SINGLE_RETRIES} in {retry_delay:.1f}s)"
+            )
+            if retry_delay > 0:
+                await asyncio.sleep(retry_delay)
+        except Exception as e:
+            print(f"\nSingle request failed: {e}")
+            return None
+    return None
+
+
 async def fetch_batch_embeddings(session, batch_prompts):
     """
     Fetch embeddings for a batch.  If the proxy identifies a specific bad item
@@ -333,7 +470,13 @@ async def fetch_batch_embeddings(session, batch_prompts):
 
     while pending:
         prompts = [p for _, p in pending]
-        payload = {"input": prompts, "model": EMBEDDING_MODEL}
+        payload = {
+            "input": prompts,
+            "model": EMBEDDING_MODEL,
+            **EMBEDDING_EXTRA_BODY,
+        }
+        if EMBEDDING_POOLING:
+            payload["pooling"] = EMBEDDING_POOLING
 
         try:
             async with session.post(
@@ -349,6 +492,7 @@ async def fetch_batch_embeddings(session, batch_prompts):
                 else:
                     error_text = await response.text()
                     print(f"\nProxy Error {response.status}: {error_text}")
+                    _print_proxy_contract_hint(error_text)
 
                     bad_idx = _parse_bad_item_index(error_text)
                     if bad_idx is not None and bad_idx < len(pending):
@@ -369,6 +513,19 @@ async def fetch_batch_embeddings(session, batch_prompts):
     return results
 
 
+async def fetch_embeddings(session, batch_prompts):
+    if PROXY_API_STYLE == "native_single":
+        semaphore = asyncio.Semaphore(NATIVE_SINGLE_CONCURRENCY)
+
+        async def _limited_single(prompt):
+            async with semaphore:
+                return await fetch_single_embedding(session, prompt)
+
+        tasks = [_limited_single(prompt) for prompt in batch_prompts]
+        return await asyncio.gather(*tasks)
+    return await fetch_batch_embeddings(session, batch_prompts)
+
+
 async def process_dataset():
     # Use asyncio's signal integration so SIGTERM raises CancelledError at the
     # next await point — the try/finally block runs cleanly with no traceback.
@@ -381,7 +538,21 @@ async def process_dataset():
     print(f"Qwen output root: {OUTPUT_DIR}")
     print(f"Qwen archive dir: {ARCHIVE_DIR}")
     print(f"Qwen archive rows: {ARCHIVE_EVERY:,}")
+    print(f"Qwen checkpoint rows: {CHECKPOINT_EVERY:,}")
     print(f"Qwen proxy URL: {PROXY_URL}")
+    print(f"Qwen proxy API style: {PROXY_API_STYLE}")
+    if PROXY_API_STYLE == "native_single":
+        print(
+            "Qwen native request limits: "
+            f"concurrency={NATIVE_SINGLE_CONCURRENCY} retries={NATIVE_SINGLE_RETRIES}"
+        )
+    print(f"Qwen expected embedding format: {EXPECTED_EMBEDDING_FORMAT}")
+    print(f"Qwen request pooling: {EMBEDDING_POOLING or 'default'}")
+    if EMBEDDING_EXTRA_BODY:
+        print(
+            "Qwen extra request body keys: "
+            + ", ".join(sorted(EMBEDDING_EXTRA_BODY.keys()))
+        )
     df = pd.read_parquet(DATASET_PATH)
     prompt_column = _resolve_prompt_column(df)
     total_rows = df.shape[0]
@@ -477,7 +648,7 @@ async def process_dataset():
         try:
             for i in range(start_i, total_rows, BATCH_SIZE):
                 batch_slice = df[prompt_column].iloc[i : i + BATCH_SIZE].tolist()
-                embeddings = await fetch_batch_embeddings(session, batch_slice)
+                embeddings = await fetch_embeddings(session, batch_slice)
 
                 if len(embeddings) == len(batch_slice):
                     df.loc[i : i + BATCH_SIZE - 1, "qwen_embedding"] = pd.array(
@@ -488,6 +659,16 @@ async def process_dataset():
                         detected_format is not None
                         and detected_format != recorded_embedding_format
                     ):
+                        if (
+                            EXPECTED_EMBEDDING_FORMAT != "auto"
+                            and detected_format != EXPECTED_EMBEDDING_FORMAT
+                        ):
+                            raise RuntimeError(
+                                "Qwen embedding contract mismatch: expected "
+                                f"{EXPECTED_EMBEDDING_FORMAT}, got {detected_format}. "
+                                "The current embedding proxy may still be flattening token sequences "
+                                "into pooled vectors before returning them."
+                            )
                         recorded_embedding_format = detected_format
                         _write_source_manifest(prompt_column, recorded_embedding_format)
                     # Record any individual None embeddings within the batch
@@ -505,8 +686,24 @@ async def process_dataset():
                 pbar.update(len(batch_slice))
 
                 # Periodic checkpoint
-                rows_done = i + BATCH_SIZE
-                if rows_done % CHECKPOINT_EVERY < BATCH_SIZE:
+                rows_done = min(i + BATCH_SIZE, total_rows)
+                archive_due = rows_done - (archive_max_pos + 1) >= ARCHIVE_EVERY
+                checkpoint_due = rows_done % CHECKPOINT_EVERY < BATCH_SIZE
+                if archive_due:
+                    try:
+                        archive_max_pos = write_archive(
+                            df, archive_max_pos + 1, rows_done
+                        )
+                    except Exception as arc_err:
+                        print(f"\nWARNING: archive failed: {arc_err}")
+                        try:
+                            save_checkpoint_delta(df, archive_max_pos, rows_done)
+                            print(f"\nCheckpoint saved ({rows_done:,} rows)")
+                        except Exception as ckpt_err:
+                            print(
+                                f"\nWARNING: checkpoint failed at row {rows_done:,}: {ckpt_err}"
+                            )
+                elif checkpoint_due:
                     try:
                         save_checkpoint_delta(df, archive_max_pos, rows_done)
                         print(f"\nCheckpoint saved ({rows_done:,} rows)")
@@ -514,14 +711,6 @@ async def process_dataset():
                         print(
                             f"\nWARNING: checkpoint failed at row {rows_done:,}: {ckpt_err}"
                         )
-                    # Archive when the delta has grown large enough
-                    if rows_done - (archive_max_pos + 1) >= ARCHIVE_EVERY:
-                        try:
-                            archive_max_pos = write_archive(
-                                df, archive_max_pos + 1, rows_done
-                            )
-                        except Exception as arc_err:
-                            print(f"\nWARNING: archive failed: {arc_err}")
 
         finally:
             pbar.close()
