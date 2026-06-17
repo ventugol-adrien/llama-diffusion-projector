@@ -1,7 +1,11 @@
+import copy
 import os
 import math
+import hashlib
+import shutil
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from time import perf_counter
 
 # RDNA4 (gfx1200) can require an explicit override on ROCm so PyTorch builds
@@ -68,6 +72,35 @@ class SDXLMonitorConfig:
     metric_name: str = "mse"
     norm_ratio_weight: float = 0.0
     std_ratio_weight: float = 0.0
+    prompt_norm_match_weight: float = 0.0
+    pooled_norm_match_weight: float = 0.0
+
+
+@dataclass(frozen=True)
+class EmbeddingStandardizationConfig:
+    enabled: bool = False
+    eps: float = 1e-6
+    threads: int = 1
+    cache_archives: bool = False
+    cache_dir: str | None = None
+    cache_compress: bool = False
+    cache_dtype: str = "source"
+
+
+@dataclass
+class EmbeddingStandardizationStats:
+    qwen_mean: np.ndarray
+    qwen_std: np.ndarray
+    target_means: dict
+    target_stds: dict
+
+
+class TrainingInterrupted(RuntimeError):
+    def __init__(self, checkpoint_path):
+        super().__init__(
+            f"Training interrupted. Resume checkpoint saved to {checkpoint_path}"
+        )
+        self.checkpoint_path = checkpoint_path
 
 
 def _build_sdxl_loss_config():
@@ -94,6 +127,32 @@ def _build_sdxl_monitor_config():
         metric_name=metric_name,
         norm_ratio_weight=max(_env_float("TRAIN_SDXL_MONITOR_NORM_WEIGHT", 0.0), 0.0),
         std_ratio_weight=max(_env_float("TRAIN_SDXL_MONITOR_STD_WEIGHT", 0.0), 0.0),
+        prompt_norm_match_weight=max(
+            _env_float("TRAIN_SDXL_MONITOR_PROMPT_NORM_MATCH_WEIGHT", 0.0), 0.0
+        ),
+        pooled_norm_match_weight=max(
+            _env_float("TRAIN_SDXL_MONITOR_POOLED_NORM_MATCH_WEIGHT", 0.0), 0.0
+        ),
+    )
+
+
+def _build_embedding_standardization_config(default_threads=1):
+    cache_dtype = (
+        _env_str("TRAIN_STANDARDIZED_ARCHIVE_CACHE_DTYPE", "source").strip().lower()
+    )
+    if cache_dtype not in {"source", "float16", "float32"}:
+        raise ValueError(
+            "TRAIN_STANDARDIZED_ARCHIVE_CACHE_DTYPE must be one of: "
+            "source, float16, float32."
+        )
+    return EmbeddingStandardizationConfig(
+        enabled=_env_bool("TRAIN_STANDARDIZE_EMBEDDINGS", False),
+        eps=max(_env_float("TRAIN_STANDARDIZATION_EPS", 1e-6), 1e-12),
+        threads=max(_env_int("TRAIN_STANDARDIZATION_THREADS", default_threads), 1),
+        cache_archives=_env_bool("TRAIN_CACHE_STANDARDIZED_ARCHIVES", False),
+        cache_dir=_env_str("TRAIN_STANDARDIZED_ARCHIVE_CACHE_DIR", "").strip() or None,
+        cache_compress=_env_bool("TRAIN_STANDARDIZED_ARCHIVE_COMPRESS", False),
+        cache_dtype=cache_dtype,
     )
 
 
@@ -154,6 +213,484 @@ def _slice_target_bundle(bundle, start, end):
 
 def _bundle_from_numpy(bundle):
     return {key: torch.from_numpy(value) for key, value in bundle.items()}
+
+
+def _select_target_bundle_np(bundle, indices):
+    return {key: value[indices] for key, value in bundle.items()}
+
+
+def _concat_target_bundles_np(*bundles):
+    active_bundles = [bundle for bundle in bundles if bundle is not None]
+    if not active_bundles:
+        return {}
+    if len(active_bundles) == 1:
+        return active_bundles[0]
+    return {
+        key: np.concatenate([bundle[key] for bundle in active_bundles], axis=0)
+        for key in active_bundles[0]
+    }
+
+
+def _init_feature_stats_accumulator(feature_dim):
+    return {
+        "count": 0,
+        "sum": np.zeros(feature_dim, dtype=np.float64),
+        "sum_sq": np.zeros(feature_dim, dtype=np.float64),
+    }
+
+
+def _accumulate_feature_stats(accumulator, array):
+    flat = np.asarray(array, dtype=np.float32).reshape(-1, array.shape[-1])
+    flat64 = flat.astype(np.float64, copy=False)
+    accumulator["count"] += int(flat64.shape[0])
+    accumulator["sum"] += flat64.sum(axis=0)
+    accumulator["sum_sq"] += np.square(flat64).sum(axis=0)
+
+
+def _finalize_feature_stats(accumulator, eps):
+    count = max(int(accumulator["count"]), 1)
+    mean64 = accumulator["sum"] / count
+    variance64 = np.maximum(accumulator["sum_sq"] / count - np.square(mean64), 0.0)
+    mean = mean64.astype(np.float32)
+    std = np.sqrt(variance64, dtype=np.float64).astype(np.float32)
+    std = np.maximum(std, np.float32(eps))
+    return mean, std
+
+
+def _merge_feature_stats_accumulator(destination, source):
+    destination["count"] += int(source["count"])
+    destination["sum"] += source["sum"]
+    destination["sum_sq"] += source["sum_sq"]
+
+
+def _qwen_feature_array_from_bundle(bundle):
+    if isinstance(bundle, dict):
+        return bundle["token_embeddings"]
+    return bundle
+
+
+def _compute_standardization_stats_from_arrays(
+    qwen_array, target_bundle, eps, threads=1
+):
+    work_items = [("qwen", qwen_array)] + list(target_bundle.items())
+
+    def _compute_one(item):
+        key, array = item
+        return key, _feature_stats_from_array(array)
+
+    if threads > 1 and len(work_items) > 1:
+        with ThreadPoolExecutor(max_workers=min(threads, len(work_items))) as executor:
+            stats_results = list(executor.map(_compute_one, work_items))
+    else:
+        stats_results = [_compute_one(item) for item in work_items]
+
+    stats_map = {key: accumulator for key, accumulator in stats_results}
+    qwen_mean, qwen_std = _finalize_feature_stats(stats_map["qwen"], eps)
+    target_means = {}
+    target_stds = {}
+    for key in target_bundle:
+        target_mean, target_std = _finalize_feature_stats(stats_map[key], eps)
+        target_means[key] = target_mean
+        target_stds[key] = target_std
+    return EmbeddingStandardizationStats(
+        qwen_mean=qwen_mean,
+        qwen_std=qwen_std,
+        target_means=target_means,
+        target_stds=target_stds,
+    )
+
+
+def _feature_stats_from_array(array):
+    accumulator = _init_feature_stats_accumulator(int(array.shape[-1]))
+    _accumulate_feature_stats(accumulator, array)
+    return accumulator
+
+
+def _emit_standardization_phase_progress(
+    phase_name,
+    completed_items,
+    total_items,
+    completed_rows,
+    total_rows,
+    elapsed_s,
+):
+    if total_items <= 0:
+        return
+    item_pct = (100.0 * completed_items) / total_items
+    row_pct = (100.0 * completed_rows) / max(total_rows, 1)
+    print(
+        f"Standardization {phase_name}: "
+        f"archives={completed_items:,}/{total_items:,} ({item_pct:.1f}%) | "
+        f"rows={completed_rows:,}/{total_rows:,} ({row_pct:.1f}%) | "
+        f"elapsed={elapsed_s:.1f}s",
+        flush=True,
+    )
+
+
+def _run_standardization_phase(
+    phase_name,
+    plan,
+    threads,
+    worker,
+    consume_result,
+):
+    total_items = len(plan)
+    total_rows = sum(take for _, take in plan)
+    if total_items == 0:
+        return
+
+    report_every = max(1, total_items // 20)
+    completed_items = 0
+    completed_rows = 0
+    phase_start = perf_counter()
+
+    if threads > 1 and total_items > 1:
+        with ThreadPoolExecutor(max_workers=min(threads, total_items)) as executor:
+            future_to_take = {executor.submit(worker, item): item[1] for item in plan}
+            for future in as_completed(future_to_take):
+                consume_result(future.result())
+                completed_items += 1
+                completed_rows += future_to_take[future]
+                if (
+                    completed_items == total_items
+                    or completed_items == 1
+                    or completed_items % report_every == 0
+                ):
+                    _emit_standardization_phase_progress(
+                        phase_name,
+                        completed_items,
+                        total_items,
+                        completed_rows,
+                        total_rows,
+                        perf_counter() - phase_start,
+                    )
+    else:
+        for item in plan:
+            consume_result(worker(item))
+            completed_items += 1
+            completed_rows += item[1]
+            if (
+                completed_items == total_items
+                or completed_items == 1
+                or completed_items % report_every == 0
+            ):
+                _emit_standardization_phase_progress(
+                    phase_name,
+                    completed_items,
+                    total_items,
+                    completed_rows,
+                    total_rows,
+                    perf_counter() - phase_start,
+                )
+
+
+def _compute_standardization_stats_from_archives(
+    qwen_archives,
+    clip_archives,
+    total_rows,
+    target_family,
+    eps,
+    threads=1,
+):
+    print(
+        "Computing embedding standardization stats "
+        f"across {total_rows:,} rows "
+        f"({len(qwen_archives)} Qwen archive(s), {len(clip_archives)} target archive(s), "
+        f"threads={threads})...",
+        flush=True,
+    )
+    qwen_accumulator = None
+    target_accumulators = {}
+
+    def _build_archive_plan(archives):
+        plan = []
+        rows_left = total_rows
+        for path in archives:
+            if rows_left <= 0:
+                break
+            with np.load(path, allow_pickle=False) as data:
+                take = min(rows_left, len(data["indices"]))
+            plan.append((path, take))
+            rows_left -= take
+        return plan
+
+    def _compute_qwen_archive_stats(item):
+        path, take = item
+        with np.load(path, allow_pickle=False) as data:
+            qwen_bundle = _slice_qwen_bundle_np(
+                _load_qwen_bundle_from_archive(data),
+                0,
+                take,
+            )
+            qwen_array = _qwen_feature_array_from_bundle(qwen_bundle)
+        accumulator = _init_feature_stats_accumulator(int(qwen_array.shape[-1]))
+        _accumulate_feature_stats(accumulator, qwen_array)
+        return accumulator
+
+    def _compute_target_archive_stats(item):
+        path, take = item
+        with np.load(path, allow_pickle=False) as data:
+            target_bundle = _load_target_bundle_from_archive(data, target_family)
+        local_accumulators = {}
+        for key, array in target_bundle.items():
+            accumulator = _init_feature_stats_accumulator(int(array.shape[-1]))
+            _accumulate_feature_stats(accumulator, array[:take])
+            local_accumulators[key] = accumulator
+        return local_accumulators
+
+    qwen_plan = _build_archive_plan(qwen_archives)
+    target_plan = _build_archive_plan(clip_archives)
+
+    def _consume_qwen_result(accumulator):
+        nonlocal qwen_accumulator
+        if qwen_accumulator is None:
+            qwen_accumulator = _init_feature_stats_accumulator(
+                int(accumulator["sum"].shape[0])
+            )
+        _merge_feature_stats_accumulator(qwen_accumulator, accumulator)
+
+    def _consume_target_result(local_accumulators):
+        for key, accumulator in local_accumulators.items():
+            if key not in target_accumulators:
+                target_accumulators[key] = _init_feature_stats_accumulator(
+                    int(accumulator["sum"].shape[0])
+                )
+            _merge_feature_stats_accumulator(target_accumulators[key], accumulator)
+
+    _run_standardization_phase(
+        "qwen",
+        qwen_plan,
+        threads,
+        _compute_qwen_archive_stats,
+        _consume_qwen_result,
+    )
+    _run_standardization_phase(
+        "target",
+        target_plan,
+        threads,
+        _compute_target_archive_stats,
+        _consume_target_result,
+    )
+
+    qwen_mean, qwen_std = _finalize_feature_stats(qwen_accumulator, eps)
+    target_means = {}
+    target_stds = {}
+    for key, accumulator in target_accumulators.items():
+        target_mean, target_std = _finalize_feature_stats(accumulator, eps)
+        target_means[key] = target_mean
+        target_stds[key] = target_std
+    print("Finished computing embedding standardization stats.", flush=True)
+    return EmbeddingStandardizationStats(
+        qwen_mean=qwen_mean,
+        qwen_std=qwen_std,
+        target_means=target_means,
+        target_stds=target_stds,
+    )
+
+
+def _apply_feature_standardization(array, mean, std):
+    return (
+        (np.asarray(array, dtype=np.float32) - mean.astype(np.float32, copy=False))
+        / std.astype(np.float32, copy=False)
+    ).astype(np.float32, copy=False)
+
+
+def _apply_standardization_to_qwen_bundle(bundle, stats):
+    if stats is None:
+        return bundle
+    if isinstance(bundle, dict):
+        standardized = dict(bundle)
+        standardized["token_embeddings"] = _apply_feature_standardization(
+            bundle["token_embeddings"],
+            stats.qwen_mean,
+            stats.qwen_std,
+        )
+        return standardized
+    return _apply_feature_standardization(bundle, stats.qwen_mean, stats.qwen_std)
+
+
+def _apply_standardization_to_target_bundle(bundle, stats):
+    if stats is None:
+        return bundle
+    return {
+        key: _apply_feature_standardization(
+            array,
+            stats.target_means[key],
+            stats.target_stds[key],
+        )
+        for key, array in bundle.items()
+    }
+
+
+def _standardization_tensors_for_device(model, device):
+    if not getattr(model, "uses_embedding_standardization", False):
+        return None
+
+    stats = getattr(model, "embedding_standardization_stats", None)
+    if stats is None:
+        return None
+
+    cache = getattr(model, "_embedding_standardization_tensor_cache", None)
+    if cache is None:
+        cache = {}
+        model._embedding_standardization_tensor_cache = cache
+
+    device_key = str(device)
+    if device_key not in cache:
+        cache[device_key] = {
+            "qwen_mean": torch.as_tensor(
+                stats.qwen_mean,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "qwen_std": torch.as_tensor(
+                stats.qwen_std,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "target_means": {
+                key: torch.as_tensor(value, device=device, dtype=torch.float32)
+                for key, value in stats.target_means.items()
+            },
+            "target_stds": {
+                key: torch.as_tensor(value, device=device, dtype=torch.float32)
+                for key, value in stats.target_stds.items()
+            },
+        }
+    return cache[device_key]
+
+
+def _apply_feature_standardization_torch(tensor, mean, std):
+    return (tensor - mean) / std
+
+
+def _apply_qwen_standardization_torch(bundle, tensors):
+    if tensors is None:
+        return bundle
+    if isinstance(bundle, dict):
+        standardized = dict(bundle)
+        standardized["token_embeddings"] = _apply_feature_standardization_torch(
+            bundle["token_embeddings"],
+            tensors["qwen_mean"],
+            tensors["qwen_std"],
+        )
+        return standardized
+    return _apply_feature_standardization_torch(
+        bundle,
+        tensors["qwen_mean"],
+        tensors["qwen_std"],
+    )
+
+
+def _apply_target_standardization_torch(bundle, tensors):
+    if tensors is None:
+        return bundle
+    return {
+        key: _apply_feature_standardization_torch(
+            value,
+            tensors["target_means"][key],
+            tensors["target_stds"][key],
+        )
+        for key, value in bundle.items()
+    }
+
+
+def _attach_standardization_to_model(model, config, stats):
+    enabled = bool(config.enabled and stats is not None)
+    model.uses_embedding_standardization = enabled
+    model.embedding_standardization_config = config
+    model.embedding_standardization_stats = stats
+
+
+def _standardization_checkpoint_payload(model):
+    stats = getattr(model, "embedding_standardization_stats", None)
+    config = getattr(model, "embedding_standardization_config", None)
+    if not getattr(model, "uses_embedding_standardization", False) or stats is None:
+        return None
+    return {
+        "enabled": True,
+        "eps": getattr(config, "eps", 1e-6),
+        "qwen_mean": torch.as_tensor(stats.qwen_mean, dtype=torch.float32),
+        "qwen_std": torch.as_tensor(stats.qwen_std, dtype=torch.float32),
+        "target_means": {
+            key: torch.as_tensor(value, dtype=torch.float32)
+            for key, value in stats.target_means.items()
+        },
+        "target_stds": {
+            key: torch.as_tensor(value, dtype=torch.float32)
+            for key, value in stats.target_stds.items()
+        },
+    }
+
+
+def _deserialize_standardization_stats(payload):
+    if not isinstance(payload, dict) or not payload.get("enabled"):
+        return None, EmbeddingStandardizationConfig()
+
+    def _as_numpy_f32(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().astype(np.float32, copy=False)
+        return np.asarray(value, dtype=np.float32)
+
+    stats = EmbeddingStandardizationStats(
+        qwen_mean=_as_numpy_f32(payload["qwen_mean"]),
+        qwen_std=_as_numpy_f32(payload["qwen_std"]),
+        target_means={
+            key: _as_numpy_f32(value)
+            for key, value in payload.get("target_means", {}).items()
+        },
+        target_stds={
+            key: _as_numpy_f32(value)
+            for key, value in payload.get("target_stds", {}).items()
+        },
+    )
+    config = EmbeddingStandardizationConfig(
+        enabled=True,
+        eps=max(float(payload.get("eps", 1e-6)), 1e-12),
+    )
+    return stats, config
+
+
+def _restore_standardization_from_payload(model, payload):
+    stats, config = _deserialize_standardization_stats(payload)
+    _attach_standardization_to_model(model, config, stats)
+
+
+def _gguf_standardization_tensor_name(key, suffix):
+    return f"standardization.{key}.{suffix}"
+
+
+def _gguf_standardization_payload_from_tensors(reader, tensor_map):
+    enabled = bool(
+        int(_gguf_field_value(reader, "projector.uses_embedding_standardization", 0))
+    )
+    qwen_mean = tensor_map.get(_gguf_standardization_tensor_name("qwen", "mean"))
+    qwen_std = tensor_map.get(_gguf_standardization_tensor_name("qwen", "std"))
+    if qwen_mean is None or qwen_std is None:
+        return None
+
+    target_means = {}
+    target_stds = {}
+    for key in ("embedding", "prompt_embeds", "pooled_prompt_embeds"):
+        mean = tensor_map.get(_gguf_standardization_tensor_name(key, "mean"))
+        std = tensor_map.get(_gguf_standardization_tensor_name(key, "std"))
+        if mean is not None and std is not None:
+            target_means[key] = (
+                mean.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            target_stds[key] = std.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    if not enabled and not target_means:
+        return None
+
+    return {
+        "enabled": True,
+        "eps": 1e-6,
+        "qwen_mean": qwen_mean.detach().cpu().numpy().astype(np.float32, copy=False),
+        "qwen_std": qwen_std.detach().cpu().numpy().astype(np.float32, copy=False),
+        "target_means": target_means,
+        "target_stds": target_stds,
+    }
 
 
 def _concat_target_bundles(*bundles):
@@ -330,6 +867,10 @@ def _compute_monitor_metric(target_family, metrics, sdxl_monitor_config=None):
         metrics["mse"]
         + sdxl_monitor_config.norm_ratio_weight * norm_distance
         + sdxl_monitor_config.std_ratio_weight * std_distance
+        + sdxl_monitor_config.prompt_norm_match_weight
+        * metrics["prompt_norm_match_loss"]
+        + sdxl_monitor_config.pooled_norm_match_weight
+        * metrics["pooled_norm_match_loss"]
     )
     return composite, "composite"
 
@@ -589,6 +1130,15 @@ def _resolve_target_archives(target_layout=None, clip_archive_dir=CLIP_ARCHIVE_D
     if archives:
         return archives, target_layout.archive_dir
 
+    if target_layout.family == "sdxl":
+        flat_archive_dir = os.path.dirname(os.path.dirname(target_layout.root_dir))
+        flat_archives = _list_npz_archives(
+            flat_archive_dir,
+            target_layout.archive_prefix,
+        )
+        if flat_archives:
+            return flat_archives, flat_archive_dir
+
     if (
         target_layout.legacy_archive_dir is not None
         and target_layout.legacy_archive_prefix is not None
@@ -601,6 +1151,322 @@ def _resolve_target_archives(target_layout=None, clip_archive_dir=CLIP_ARCHIVE_D
             return legacy_archives, target_layout.legacy_archive_dir
 
     return [], target_layout.archive_dir
+
+
+STANDARDIZED_ARCHIVE_CACHE_VERSION = 1
+
+
+def _write_npz_file(npz_path, payload, compress=False):
+    parent = os.path.dirname(npz_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = npz_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        if compress:
+            np.savez_compressed(f, **payload)
+        else:
+            np.savez(f, **payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, npz_path)
+
+
+def _archive_fingerprint(paths):
+    digest = hashlib.sha256()
+    for path in paths:
+        stat = os.stat(path)
+        digest.update(os.path.basename(path).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _standardized_archive_cache_root(config, target_layout, clip_archive_dir):
+    if config.cache_dir:
+        return config.cache_dir
+    if target_layout is not None:
+        return os.path.join(target_layout.root_dir, "standardized_cache")
+    return os.path.join(os.path.dirname(clip_archive_dir), "standardized_cache")
+
+
+def _standardized_archive_cache_key(
+    qwen_archives,
+    clip_archives,
+    total_rows,
+    target_family,
+    config,
+):
+    digest = hashlib.sha256()
+    digest.update(f"v{STANDARDIZED_ARCHIVE_CACHE_VERSION}".encode("utf-8"))
+    digest.update(target_family.encode("utf-8"))
+    digest.update(str(total_rows).encode("utf-8"))
+    digest.update(f"{config.eps:.12g}".encode("utf-8"))
+    digest.update(config.cache_dtype.encode("utf-8"))
+    digest.update(_archive_fingerprint(qwen_archives).encode("utf-8"))
+    digest.update(_archive_fingerprint(clip_archives).encode("utf-8"))
+    return digest.hexdigest()[:24]
+
+
+def _standardized_archive_cache_paths(
+    qwen_archives,
+    clip_archives,
+    total_rows,
+    target_family,
+    config,
+    target_layout,
+    clip_archive_dir,
+):
+    cache_root = _standardized_archive_cache_root(
+        config, target_layout, clip_archive_dir
+    )
+    cache_key = _standardized_archive_cache_key(
+        qwen_archives,
+        clip_archives,
+        total_rows,
+        target_family,
+        config,
+    )
+    root = os.path.join(cache_root, cache_key)
+    return {
+        "root": root,
+        "tmp_root": root + ".tmp",
+        "qwen_dir": os.path.join(root, "qwen_archive"),
+        "target_dir": os.path.join(root, "target_archive"),
+        "stats_path": os.path.join(root, "stats.npz"),
+        "complete_path": os.path.join(root, "complete.marker"),
+    }
+
+
+def _standardization_stats_npz_payload(stats):
+    payload = {
+        "qwen_mean": np.asarray(stats.qwen_mean, dtype=np.float32),
+        "qwen_std": np.asarray(stats.qwen_std, dtype=np.float32),
+    }
+    for key, value in stats.target_means.items():
+        payload[f"target_mean__{key}"] = np.asarray(value, dtype=np.float32)
+    for key, value in stats.target_stds.items():
+        payload[f"target_std__{key}"] = np.asarray(value, dtype=np.float32)
+    return payload
+
+
+def _load_standardization_stats_npz(path):
+    with np.load(path, allow_pickle=False) as data:
+        target_means = {}
+        target_stds = {}
+        for key in data.files:
+            if key.startswith("target_mean__"):
+                target_means[key.split("__", 1)[1]] = np.asarray(
+                    data[key], dtype=np.float32
+                )
+            elif key.startswith("target_std__"):
+                target_stds[key.split("__", 1)[1]] = np.asarray(
+                    data[key], dtype=np.float32
+                )
+        return EmbeddingStandardizationStats(
+            qwen_mean=np.asarray(data["qwen_mean"], dtype=np.float32),
+            qwen_std=np.asarray(data["qwen_std"], dtype=np.float32),
+            target_means=target_means,
+            target_stds=target_stds,
+        )
+
+
+def _cache_array_dtype(reference_array, cache_dtype):
+    if cache_dtype == "source":
+        return np.asarray(reference_array).dtype
+    if cache_dtype == "float16":
+        return np.float16
+    return np.float32
+
+
+def _cast_qwen_bundle_for_cache(bundle, reference_bundle, cache_dtype):
+    if isinstance(bundle, dict):
+        cached = dict(bundle)
+        cached["token_embeddings"] = np.asarray(
+            bundle["token_embeddings"],
+            dtype=_cache_array_dtype(reference_bundle["token_embeddings"], cache_dtype),
+        )
+        return cached
+    return np.asarray(bundle, dtype=_cache_array_dtype(reference_bundle, cache_dtype))
+
+
+def _cast_target_bundle_for_cache(bundle, reference_bundle, cache_dtype):
+    return {
+        key: np.asarray(
+            value,
+            dtype=_cache_array_dtype(reference_bundle[key], cache_dtype),
+        )
+        for key, value in bundle.items()
+    }
+
+
+def _qwen_archive_payload(bundle, indices):
+    payload = {"indices": np.asarray(indices, dtype=np.int64)}
+    if isinstance(bundle, dict):
+        payload["token_embeddings"] = np.asarray(bundle["token_embeddings"])
+        payload["token_offsets"] = np.asarray(bundle["token_offsets"], dtype=np.int64)
+        payload["sequence_lengths"] = np.asarray(
+            bundle["sequence_lengths"], dtype=np.int32
+        )
+        return payload
+    payload["embeddings"] = np.asarray(bundle)
+    return payload
+
+
+def _target_archive_payload(bundle, indices):
+    payload = {"indices": np.asarray(indices, dtype=np.int64)}
+    payload.update({key: np.asarray(value) for key, value in bundle.items()})
+    return payload
+
+
+def _cache_archive_paths(raw_paths, cache_dir, total_rows):
+    cache_paths = []
+    rows_left = total_rows
+    for raw_path in raw_paths:
+        if rows_left <= 0:
+            break
+        with np.load(raw_path, allow_pickle=False) as data:
+            rows_left -= len(data["indices"])
+        cache_paths.append(os.path.join(cache_dir, os.path.basename(raw_path)))
+    return cache_paths
+
+
+def _load_standardized_archive_cache(
+    cache_paths,
+    raw_qwen_archives,
+    raw_clip_archives,
+    total_rows,
+):
+    if not os.path.exists(cache_paths["complete_path"]):
+        return None
+    if not os.path.exists(cache_paths["stats_path"]):
+        return None
+    cached_qwen_archives = _cache_archive_paths(
+        raw_qwen_archives,
+        cache_paths["qwen_dir"],
+        total_rows,
+    )
+    cached_clip_archives = _cache_archive_paths(
+        raw_clip_archives,
+        cache_paths["target_dir"],
+        total_rows,
+    )
+    if not all(
+        os.path.exists(path) for path in cached_qwen_archives + cached_clip_archives
+    ):
+        return None
+    return {
+        "stats": _load_standardization_stats_npz(cache_paths["stats_path"]),
+        "qwen_archives": cached_qwen_archives,
+        "clip_archives": cached_clip_archives,
+        "target_dir": cache_paths["target_dir"],
+        "root": cache_paths["root"],
+    }
+
+
+def _materialize_standardized_archive_cache(
+    cache_paths,
+    raw_qwen_archives,
+    raw_clip_archives,
+    total_rows,
+    target_family,
+    stats,
+    config,
+):
+    if os.path.exists(cache_paths["tmp_root"]):
+        shutil.rmtree(cache_paths["tmp_root"])
+    os.makedirs(
+        cache_paths["qwen_dir"].replace(cache_paths["root"], cache_paths["tmp_root"]),
+        exist_ok=True,
+    )
+    os.makedirs(
+        cache_paths["target_dir"].replace(cache_paths["root"], cache_paths["tmp_root"]),
+        exist_ok=True,
+    )
+    tmp_qwen_dir = cache_paths["qwen_dir"].replace(
+        cache_paths["root"], cache_paths["tmp_root"]
+    )
+    tmp_target_dir = cache_paths["target_dir"].replace(
+        cache_paths["root"], cache_paths["tmp_root"]
+    )
+    tmp_stats_path = cache_paths["stats_path"].replace(
+        cache_paths["root"], cache_paths["tmp_root"]
+    )
+    tmp_complete_path = cache_paths["complete_path"].replace(
+        cache_paths["root"], cache_paths["tmp_root"]
+    )
+
+    print(
+        f"Materializing standardized archive cache at {cache_paths['root']}...",
+        flush=True,
+    )
+
+    rows_left = total_rows
+    for raw_path in raw_qwen_archives:
+        if rows_left <= 0:
+            break
+        with np.load(raw_path, allow_pickle=False) as data:
+            raw_bundle = _load_qwen_bundle_from_archive(data)
+            take = min(rows_left, _qwen_rows(raw_bundle))
+            raw_bundle = _slice_qwen_bundle_np(raw_bundle, 0, take)
+            standardized_bundle = _apply_standardization_to_qwen_bundle(
+                raw_bundle, stats
+            )
+            cached_bundle = _cast_qwen_bundle_for_cache(
+                standardized_bundle,
+                raw_bundle,
+                config.cache_dtype,
+            )
+            payload = _qwen_archive_payload(cached_bundle, data["indices"][:take])
+        _write_npz_file(
+            os.path.join(tmp_qwen_dir, os.path.basename(raw_path)),
+            payload,
+            compress=config.cache_compress,
+        )
+        rows_left -= take
+
+    rows_left = total_rows
+    for raw_path in raw_clip_archives:
+        if rows_left <= 0:
+            break
+        with np.load(raw_path, allow_pickle=False) as data:
+            raw_bundle = _load_target_bundle_from_archive(data, target_family)
+            take = min(rows_left, len(data["indices"]))
+            sliced_bundle = {key: value[:take] for key, value in raw_bundle.items()}
+            standardized_bundle = _apply_standardization_to_target_bundle(
+                sliced_bundle,
+                stats,
+            )
+            cached_bundle = _cast_target_bundle_for_cache(
+                standardized_bundle,
+                sliced_bundle,
+                config.cache_dtype,
+            )
+            payload = _target_archive_payload(cached_bundle, data["indices"][:take])
+        _write_npz_file(
+            os.path.join(tmp_target_dir, os.path.basename(raw_path)),
+            payload,
+            compress=config.cache_compress,
+        )
+        rows_left -= take
+
+    _write_npz_file(
+        tmp_stats_path,
+        _standardization_stats_npz_payload(stats),
+        compress=False,
+    )
+    with open(tmp_complete_path, "w", encoding="utf-8") as f:
+        f.write("complete\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(cache_paths["root"]):
+        shutil.rmtree(cache_paths["root"])
+    os.rename(cache_paths["tmp_root"], cache_paths["root"])
+    return _load_standardized_archive_cache(
+        cache_paths,
+        raw_qwen_archives,
+        raw_clip_archives,
+        total_rows,
+    )
 
 
 def _load_target_bundle_from_archive(data, target_family):
@@ -653,22 +1519,12 @@ def _load_qwen_bundle_from_archive(data):
     if "token_embeddings" in data and "token_offsets" in data:
         token_embeddings = np.asarray(data["token_embeddings"], dtype=np.float32)
         token_offsets = np.asarray(data["token_offsets"], dtype=np.int64)
-        if "pooled_embeddings" in data:
-            pooled_embeddings = np.asarray(data["pooled_embeddings"], dtype=np.float32)
-        else:
-            pooled_rows = []
-            for row_idx in range(len(token_offsets) - 1):
-                start = int(token_offsets[row_idx])
-                end = int(token_offsets[row_idx + 1])
-                pooled_rows.append(token_embeddings[start:end].mean(axis=0))
-            pooled_embeddings = np.stack(pooled_rows).astype(np.float32, copy=False)
         if "sequence_lengths" in data:
             sequence_lengths = np.asarray(data["sequence_lengths"], dtype=np.int32)
         else:
             sequence_lengths = np.diff(token_offsets).astype(np.int32, copy=False)
         return {
             "format": "token_sequence",
-            "pooled_embeddings": pooled_embeddings,
             "token_embeddings": token_embeddings,
             "token_offsets": token_offsets,
             "sequence_lengths": sequence_lengths,
@@ -683,13 +1539,13 @@ def _load_qwen_bundle_from_archive(data):
 
 def _qwen_rows(bundle):
     if isinstance(bundle, dict):
-        return int(bundle["pooled_embeddings"].shape[0])
+        return int(bundle["sequence_lengths"].shape[0])
     return int(bundle.shape[0])
 
 
 def _qwen_input_dim(bundle):
     if isinstance(bundle, dict):
-        return int(bundle["pooled_embeddings"].shape[1])
+        return int(bundle["token_embeddings"].shape[-1])
     return int(bundle.shape[1])
 
 
@@ -701,10 +1557,69 @@ def _slice_qwen_bundle_np(bundle, start, end):
     token_end = int(bundle["token_offsets"][end])
     return {
         "format": "token_sequence",
-        "pooled_embeddings": bundle["pooled_embeddings"][start:end],
         "token_embeddings": bundle["token_embeddings"][token_start:token_end],
         "token_offsets": bundle["token_offsets"][start : end + 1] - token_start,
         "sequence_lengths": bundle["sequence_lengths"][start:end],
+    }
+
+
+def _select_qwen_bundle_np(bundle, indices):
+    if isinstance(bundle, np.ndarray):
+        return bundle[indices]
+
+    selected_indices = np.asarray(indices, dtype=np.int64)
+    sequence_lengths = bundle["sequence_lengths"][selected_indices].astype(
+        np.int32,
+        copy=False,
+    )
+    token_segments = []
+    new_offsets = np.empty(len(selected_indices) + 1, dtype=np.int64)
+    new_offsets[0] = 0
+    total_tokens = 0
+    token_offsets = bundle["token_offsets"]
+    token_embeddings = bundle["token_embeddings"]
+    for out_idx, row_idx in enumerate(selected_indices, 1):
+        token_start = int(token_offsets[row_idx])
+        token_end = int(token_offsets[row_idx + 1])
+        token_segments.append(token_embeddings[token_start:token_end])
+        total_tokens += token_end - token_start
+        new_offsets[out_idx] = total_tokens
+    if token_segments:
+        selected_tokens = np.concatenate(token_segments, axis=0)
+    else:
+        selected_tokens = token_embeddings[:0]
+    return {
+        "format": "token_sequence",
+        "token_embeddings": selected_tokens,
+        "token_offsets": new_offsets,
+        "sequence_lengths": sequence_lengths,
+    }
+
+
+def _concat_qwen_bundles_np(*bundles):
+    active = [bundle for bundle in bundles if bundle is not None]
+    if not active:
+        return None
+    if len(active) == 1:
+        return active[0]
+    first = active[0]
+    if isinstance(first, np.ndarray):
+        return np.concatenate(active, axis=0)
+
+    token_embeddings = np.concatenate(
+        [bundle["token_embeddings"] for bundle in active], axis=0
+    )
+    sequence_lengths = np.concatenate(
+        [bundle["sequence_lengths"] for bundle in active], axis=0
+    )
+    token_offsets = np.empty(sequence_lengths.shape[0] + 1, dtype=np.int64)
+    token_offsets[0] = 0
+    np.cumsum(sequence_lengths.astype(np.int64, copy=False), out=token_offsets[1:])
+    return {
+        "format": "token_sequence",
+        "token_embeddings": token_embeddings,
+        "token_offsets": token_offsets,
+        "sequence_lengths": sequence_lengths.astype(np.int32, copy=False),
     }
 
 
@@ -713,7 +1628,6 @@ def _qwen_bundle_from_numpy(bundle):
         return torch.from_numpy(bundle)
     return {
         "format": bundle["format"],
-        "pooled_embeddings": torch.from_numpy(bundle["pooled_embeddings"]),
         "token_embeddings": torch.from_numpy(bundle["token_embeddings"]),
         "token_offsets": torch.from_numpy(bundle["token_offsets"]),
         "sequence_lengths": torch.from_numpy(
@@ -726,7 +1640,6 @@ def _select_qwen_bundle(bundle, indices):
     if isinstance(bundle, torch.Tensor):
         return bundle.index_select(0, indices)
 
-    pooled_embeddings = bundle["pooled_embeddings"].index_select(0, indices)
     sequence_lengths = bundle["sequence_lengths"].index_select(0, indices)
     selected_indices = indices.tolist()
     token_segments = []
@@ -744,7 +1657,6 @@ def _select_qwen_bundle(bundle, indices):
         )
     return {
         "format": "token_sequence",
-        "pooled_embeddings": pooled_embeddings,
         "token_embeddings": token_embeddings,
         "token_offsets": torch.tensor(new_offsets, dtype=torch.int64),
         "sequence_lengths": sequence_lengths,
@@ -761,9 +1673,6 @@ def _concat_qwen_bundles(*bundles):
     if isinstance(first, torch.Tensor):
         return torch.cat(active, dim=0)
 
-    pooled_embeddings = torch.cat(
-        [bundle["pooled_embeddings"] for bundle in active], dim=0
-    )
     token_embeddings = torch.cat(
         [bundle["token_embeddings"] for bundle in active], dim=0
     )
@@ -779,7 +1688,6 @@ def _concat_qwen_bundles(*bundles):
             total_tokens = int(offsets[-1].item())
     return {
         "format": "token_sequence",
-        "pooled_embeddings": pooled_embeddings,
         "token_embeddings": token_embeddings,
         "token_offsets": torch.cat(token_offsets, dim=0),
         "sequence_lengths": sequence_lengths,
@@ -794,7 +1702,6 @@ def _slice_qwen_bundle(bundle, start, end):
     token_end = int(bundle["token_offsets"][end].item())
     return {
         "format": "token_sequence",
-        "pooled_embeddings": bundle["pooled_embeddings"][start:end].clone(),
         "token_embeddings": bundle["token_embeddings"][token_start:token_end].clone(),
         "token_offsets": bundle["token_offsets"][start : end + 1].clone() - token_start,
         "sequence_lengths": bundle["sequence_lengths"][start:end].clone(),
@@ -827,11 +1734,10 @@ def _materialize_qwen_batch(bundle):
     if isinstance(bundle, torch.Tensor):
         return bundle
 
-    batch_size = int(bundle["pooled_embeddings"].shape[0])
+    batch_size = int(bundle["sequence_lengths"].shape[0])
     if batch_size == 0:
         hidden_dim = int(bundle["token_embeddings"].shape[-1])
         return {
-            "pooled_embeddings": bundle["pooled_embeddings"],
             "token_embeddings": bundle["token_embeddings"].new_empty(
                 (0, 0, hidden_dim)
             ),
@@ -840,8 +1746,8 @@ def _materialize_qwen_batch(bundle):
         }
 
     max_tokens = int(bundle["sequence_lengths"].max().item())
-    hidden_dim = int(bundle["pooled_embeddings"].shape[1])
-    token_matrix = bundle["pooled_embeddings"].new_zeros(
+    hidden_dim = int(bundle["token_embeddings"].shape[-1])
+    token_matrix = bundle["token_embeddings"].new_zeros(
         (batch_size, max_tokens, hidden_dim)
     )
     attention_mask = torch.zeros((batch_size, max_tokens), dtype=torch.bool)
@@ -856,11 +1762,28 @@ def _materialize_qwen_batch(bundle):
         ]
         attention_mask[row_idx, :token_count] = True
     return {
-        "pooled_embeddings": bundle["pooled_embeddings"],
         "token_embeddings": token_matrix,
         "attention_mask": attention_mask,
         "sequence_lengths": bundle["sequence_lengths"],
     }
+
+
+def _pooled_embeddings_from_qwen_batch(batch_qwen):
+    if isinstance(batch_qwen, torch.Tensor):
+        return batch_qwen
+
+    token_embeddings = batch_qwen["token_embeddings"]
+    if token_embeddings.ndim == 2:
+        return token_embeddings
+
+    attention_mask = batch_qwen.get("attention_mask")
+    if attention_mask is None:
+        return token_embeddings.mean(dim=1)
+
+    weights = attention_mask.to(dtype=token_embeddings.dtype).unsqueeze(-1)
+    token_sums = (token_embeddings * weights).sum(dim=1)
+    token_counts = weights.sum(dim=1).clamp_min(1.0)
+    return token_sums / token_counts
 
 
 def _forward_qwen_model(model, batch_qwen):
@@ -868,7 +1791,7 @@ def _forward_qwen_model(model, batch_qwen):
         return model(batch_qwen)
     if getattr(model, "expects_qwen_sequences", False):
         return model(batch_qwen)
-    return model(batch_qwen["pooled_embeddings"])
+    return model(_pooled_embeddings_from_qwen_batch(batch_qwen))
 
 
 # ==========================================
@@ -984,6 +1907,66 @@ class QwenToSDXLProjector(nn.Module):
             prompt_out = self.prompt_output_calibrator(prompt_out)
             pooled_out = self.pooled_output_calibrator(pooled_out)
         return prompt_out, pooled_out
+
+
+def _module_uses_weight_parametrization(module):
+    parametrizations = getattr(module, "parametrizations", None)
+    return parametrizations is not None and hasattr(parametrizations, "weight")
+
+
+def _sdxl_mlp_linear_layers(model):
+    if not isinstance(model, QwenToSDXLProjector):
+        return []
+
+    linear_layers = [
+        model.input_projection[0],
+        model.input_projection[2],
+        model.prompt_seed,
+        model.prompt_projection[1],
+        model.prompt_projection[3],
+        model.pooled_head[0],
+        model.pooled_head[2],
+    ]
+    for block in model.trunk_layers:
+        linear_layers.extend([block.fc1, block.fc2])
+    return linear_layers
+
+
+def _apply_spectral_norm_to_module(module):
+    if _module_uses_weight_parametrization(module):
+        return module
+    nn.utils.parametrizations.spectral_norm(module)
+    return module
+
+
+def _remove_weight_parametrization(module):
+    if _module_uses_weight_parametrization(module):
+        torch.nn.utils.parametrize.remove_parametrizations(
+            module,
+            "weight",
+            leave_parametrized=True,
+        )
+
+
+def _configure_sdxl_projector_stability(model, use_spectral_norm=False):
+    model.use_spectral_norm = bool(use_spectral_norm)
+    if not model.use_spectral_norm:
+        return model
+    if not isinstance(model, QwenToSDXLProjector):
+        raise ValueError(
+            "TRAIN_SDXL_SPECTRAL_NORM is currently supported only for the SDXL MLP projector path."
+        )
+    for module in _sdxl_mlp_linear_layers(model):
+        _apply_spectral_norm_to_module(module)
+    return model
+
+
+def _model_for_gguf_export(model):
+    export_model = copy.deepcopy(model).cpu()
+    if getattr(export_model, "use_spectral_norm", False):
+        for module in _sdxl_mlp_linear_layers(export_model):
+            _remove_weight_parametrization(module)
+    return export_model
 
 
 class QwenResamplerBlock(nn.Module):
@@ -1153,6 +2136,7 @@ def _build_sdxl_projector(
     pooled_query_count,
     has_sequence_inputs,
     use_output_calibrator,
+    use_spectral_norm,
 ):
     if architecture == "resampler":
         if not has_sequence_inputs:
@@ -1175,18 +2159,21 @@ def _build_sdxl_projector(
             pooled_head_hidden_dim=pooled_head_hidden_dim,
         )
 
-    return QwenToSDXLProjector(
-        qwen_dim=qwen_dim,
-        prompt_seq_len=prompt_seq_len,
-        prompt_dim=prompt_dim,
-        pooled_dim=pooled_dim,
-        hidden_dim=hidden_dim,
-        prompt_token_dim=prompt_token_dim,
-        trunk_depth=trunk_depth,
-        residual_trunk=residual_trunk,
-        prompt_head_hidden_dim=prompt_head_hidden_dim,
-        pooled_head_hidden_dim=pooled_head_hidden_dim,
-        use_output_calibrator=use_output_calibrator,
+    return _configure_sdxl_projector_stability(
+        QwenToSDXLProjector(
+            qwen_dim=qwen_dim,
+            prompt_seq_len=prompt_seq_len,
+            prompt_dim=prompt_dim,
+            pooled_dim=pooled_dim,
+            hidden_dim=hidden_dim,
+            prompt_token_dim=prompt_token_dim,
+            trunk_depth=trunk_depth,
+            residual_trunk=residual_trunk,
+            prompt_head_hidden_dim=prompt_head_hidden_dim,
+            pooled_head_hidden_dim=pooled_head_hidden_dim,
+            use_output_calibrator=use_output_calibrator,
+        ),
+        use_spectral_norm=use_spectral_norm,
     )
 
 
@@ -1215,9 +2202,19 @@ def _sdxl_architecture_summary(model):
 # 2. REAL DATA LOADING (PARQUET INGESTION)
 # ==========================================
 class ParquetEmbeddingDataset(Dataset):
-    def __init__(self, parquet_path, sd_dim=1024, max_samples=None):
+    def __init__(
+        self,
+        parquet_path,
+        sd_dim=1024,
+        max_samples=None,
+        standardization_config=None,
+    ):
         print(f"Loading data from {parquet_path}...")
         df = pd.read_parquet(parquet_path)
+        self.standardization_config = (
+            standardization_config or EmbeddingStandardizationConfig()
+        )
+        self.standardization_stats = None
 
         if "clip_embedding" in df.columns:
             df = df.dropna(subset=["qwen_embedding", "clip_embedding"])
@@ -1231,25 +2228,47 @@ class ParquetEmbeddingDataset(Dataset):
         qwen_embeds = np.stack(df["qwen_embedding"].to_numpy()).astype(
             np.float32, copy=False
         )
-        self.inputs = torch.from_numpy(qwen_embeds)
-        self.input_dim = int(self.inputs.shape[1])
+        self.input_dim = int(qwen_embeds.shape[1])
 
         if "clip_embedding" in df.columns:
             print("Packing target CLIP embeddings...")
             clip_embeds = np.stack(df["clip_embedding"].to_numpy()).astype(
                 np.float32, copy=False
             )
-            self.targets = torch.from_numpy(clip_embeds)
-            self.target_dim = int(self.targets.shape[1])
+            target_bundle = {"embedding": clip_embeds}
+            self.target_dim = int(clip_embeds.shape[1])
             print(
-                f"Loaded {len(self.inputs):,} aligned training pairs "
+                f"Loaded {len(qwen_embeds):,} aligned training pairs "
                 f"({self.input_dim} -> {self.target_dim})."
             )
         else:
             print("\n⚠️  WARNING: 'clip_embedding' column not found!")
             print("Generating mock target tensors so the sanity check can run.\n")
-            self.targets = torch.randn(len(self.inputs), sd_dim, dtype=torch.float32)
+            target_bundle = {
+                "embedding": np.random.randn(len(qwen_embeds), sd_dim).astype(
+                    np.float32
+                )
+            }
             self.target_dim = sd_dim
+
+        if self.standardization_config.enabled:
+            self.standardization_stats = _compute_standardization_stats_from_arrays(
+                qwen_embeds,
+                target_bundle,
+                self.standardization_config.eps,
+                threads=self.standardization_config.threads,
+            )
+            qwen_embeds = _apply_standardization_to_qwen_bundle(
+                qwen_embeds,
+                self.standardization_stats,
+            )
+            target_bundle = _apply_standardization_to_target_bundle(
+                target_bundle,
+                self.standardization_stats,
+            )
+
+        self.inputs = torch.from_numpy(qwen_embeds)
+        self.targets = torch.from_numpy(target_bundle["embedding"])
 
         self.target_family = "sd"
 
@@ -1262,6 +2281,45 @@ class ParquetEmbeddingDataset(Dataset):
         return self.inputs[idx], {"embedding": self.targets[idx]}
 
 
+def _archive_embedding_collate(batch):
+    qwen_items, target_items = zip(*batch)
+    first_qwen = qwen_items[0]
+
+    if isinstance(first_qwen, dict):
+        lengths = torch.as_tensor(
+            [int(item["token_embeddings"].shape[0]) for item in qwen_items],
+            dtype=torch.int64,
+        )
+        batch_size = len(qwen_items)
+        max_tokens = int(lengths.max().item()) if batch_size > 0 else 0
+        hidden_dim = int(first_qwen["token_embeddings"].shape[-1])
+        token_embeddings = first_qwen["token_embeddings"].new_zeros(
+            (batch_size, max_tokens, hidden_dim)
+        )
+        attention_mask = torch.zeros((batch_size, max_tokens), dtype=torch.bool)
+        for row_idx, item in enumerate(qwen_items):
+            row_tokens = item["token_embeddings"]
+            token_count = int(row_tokens.shape[0])
+            if token_count <= 0:
+                continue
+            token_embeddings[row_idx, :token_count] = row_tokens
+            attention_mask[row_idx, :token_count] = True
+        batch_qwen = {
+            "format": "token_sequence",
+            "token_embeddings": token_embeddings,
+            "attention_mask": attention_mask,
+            "sequence_lengths": lengths,
+        }
+    else:
+        batch_qwen = torch.stack(qwen_items, dim=0)
+
+    batch_target = {
+        key: torch.stack([target[key] for target in target_items], dim=0)
+        for key in target_items[0]
+    }
+    return batch_qwen, batch_target
+
+
 class ArchiveEmbeddingDataset(Dataset):
     def __init__(
         self,
@@ -1269,8 +2327,14 @@ class ArchiveEmbeddingDataset(Dataset):
         clip_archive_dir=CLIP_ARCHIVE_DIR,
         target_layout=None,
         max_samples=None,
+        standardization_config=None,
     ):
         self.target_family = target_layout.family if target_layout is not None else "sd"
+        self.standardization_config = (
+            standardization_config or EmbeddingStandardizationConfig()
+        )
+        self.standardization_stats = None
+        self.has_sequence_inputs = False
         qwen_archives = _list_npz_archives(qwen_archive_dir, "archive_")
         clip_archives, resolved_target_dir = _resolve_target_archives(
             target_layout, clip_archive_dir
@@ -1287,19 +2351,22 @@ class ArchiveEmbeddingDataset(Dataset):
         qwen_total = 0
         qwen_dim = None
         qwen_has_sequence_inputs = False
+        qwen_total_tokens = 0
         for path in qwen_archives:
             with np.load(path, allow_pickle=False) as data:
-                qwen_total += len(data["indices"])
+                row_count = len(data["indices"])
+                qwen_total += row_count
                 if qwen_dim is None:
                     qwen_bundle = _load_qwen_bundle_from_archive(data)
                     qwen_dim = _qwen_input_dim(qwen_bundle)
                     qwen_has_sequence_inputs = isinstance(qwen_bundle, dict)
-
-        if qwen_has_sequence_inputs:
-            raise NotImplementedError(
-                "Token-sequence Qwen archives currently require streaming archive training. "
-                "Set TRAIN_ARCHIVE_IN_MEMORY_LIMIT low enough to force the streaming path."
-            )
+                if qwen_has_sequence_inputs:
+                    sequence_lengths = (
+                        np.asarray(data["sequence_lengths"], dtype=np.int64)
+                        if "sequence_lengths" in data
+                        else np.diff(np.asarray(data["token_offsets"], dtype=np.int64))
+                    )
+                    qwen_total_tokens += int(sequence_lengths[:row_count].sum())
 
         print(f"Loading target archives from {resolved_target_dir}...")
         clip_total = 0
@@ -1312,9 +2379,17 @@ class ArchiveEmbeddingDataset(Dataset):
                         data, self.target_family
                     )
 
+        common_total = min(qwen_total, clip_total)
         if qwen_total != clip_total:
-            raise RuntimeError(
-                f"Archive row mismatch: {qwen_total:,} Qwen rows vs {clip_total:,} CLIP rows"
+            if max_samples is None or max_samples > common_total:
+                raise RuntimeError(
+                    f"Archive row mismatch: {qwen_total:,} Qwen rows vs {clip_total:,} CLIP rows"
+                )
+            print(
+                "Archive row mismatch tolerated because TRAIN_MAX_SAMPLES caps "
+                f"the run to the common prefix: {qwen_total:,} Qwen rows vs "
+                f"{clip_total:,} target rows, using {max_samples:,} rows.",
+                flush=True,
             )
 
         if sample_bundle is None:
@@ -1322,28 +2397,82 @@ class ArchiveEmbeddingDataset(Dataset):
                 f"No readable target archive payloads found in {resolved_target_dir}"
             )
 
-        total_rows = qwen_total
+        total_rows = common_total
         if max_samples is not None:
             total_rows = min(total_rows, max_samples)
 
         qwen_indices = np.empty(total_rows, dtype=np.int64)
         clip_indices = np.empty(total_rows, dtype=np.int64)
-        qwen_embeds = np.empty((total_rows, qwen_dim), dtype=np.float32)
+        if qwen_has_sequence_inputs:
+            remaining_rows = total_rows
+            qwen_total_tokens = 0
+            for path in qwen_archives:
+                if remaining_rows <= 0:
+                    break
+                with np.load(path, allow_pickle=False) as data:
+                    take = min(remaining_rows, len(data["indices"]))
+                    if "sequence_lengths" in data:
+                        sequence_lengths = np.asarray(
+                            data["sequence_lengths"], dtype=np.int64
+                        )
+                    else:
+                        sequence_lengths = np.diff(
+                            np.asarray(data["token_offsets"], dtype=np.int64)
+                        )
+                    qwen_total_tokens += int(sequence_lengths[:take].sum())
+                    remaining_rows -= take
+            qwen_token_embeddings = np.empty(
+                (qwen_total_tokens, qwen_dim), dtype=np.float32
+            )
+            qwen_token_offsets = np.empty(total_rows + 1, dtype=np.int64)
+            qwen_sequence_lengths = np.empty(total_rows, dtype=np.int64)
+        else:
+            qwen_embeds = np.empty((total_rows, qwen_dim), dtype=np.float32)
         target_buffers = _allocate_target_buffers(total_rows, sample_bundle)
 
-        def _fill_buffers(archives, indices_buffer, embeddings_buffer):
+        def _fill_qwen_buffers(archives):
             offset = 0
+            token_offset = 0
             for path in archives:
                 if offset >= total_rows:
                     break
-                data = np.load(path, allow_pickle=False)
-                take = min(total_rows - offset, len(data["indices"]))
-                indices_buffer[offset : offset + take] = data["indices"][:take]
-                embeddings_buffer[offset : offset + take] = data["embeddings"][:take]
-                offset += take
+                with np.load(path, allow_pickle=False) as data:
+                    take = min(total_rows - offset, len(data["indices"]))
+                    qwen_indices[offset : offset + take] = data["indices"][:take]
+                    qwen_bundle = _load_qwen_bundle_from_archive(data)
+                    if qwen_has_sequence_inputs:
+                        if not isinstance(qwen_bundle, dict):
+                            raise RuntimeError(
+                                "Mixed vector and token-sequence Qwen archives are not supported."
+                            )
+                        source_offsets = qwen_bundle["token_offsets"]
+                        source_token_start = int(source_offsets[0])
+                        source_token_end = int(source_offsets[take])
+                        token_count = source_token_end - source_token_start
+                        qwen_token_embeddings[
+                            token_offset : token_offset + token_count
+                        ] = qwen_bundle["token_embeddings"][
+                            source_token_start:source_token_end
+                        ]
+                        qwen_token_offsets[offset : offset + take + 1] = (
+                            source_offsets[: take + 1]
+                            - source_offsets[0]
+                            + token_offset
+                        )
+                        qwen_sequence_lengths[offset : offset + take] = qwen_bundle[
+                            "sequence_lengths"
+                        ][:take]
+                        token_offset += token_count
+                    else:
+                        if isinstance(qwen_bundle, dict):
+                            raise RuntimeError(
+                                "Mixed vector and token-sequence Qwen archives are not supported."
+                            )
+                        qwen_embeds[offset : offset + take] = qwen_bundle[:take]
+                    offset += take
             return offset
 
-        qwen_filled = _fill_buffers(qwen_archives, qwen_indices, qwen_embeds)
+        qwen_filled = _fill_qwen_buffers(qwen_archives)
         clip_filled = _fill_target_buffers(
             clip_archives,
             total_rows,
@@ -1358,7 +2487,45 @@ class ArchiveEmbeddingDataset(Dataset):
         if not np.array_equal(qwen_indices, clip_indices):
             raise RuntimeError("Qwen and CLIP archive indices do not align")
 
-        self.inputs = torch.from_numpy(qwen_embeds)
+        if self.standardization_config.enabled:
+            print(
+                "Applying in-memory embedding standardization to archive dataset...",
+                flush=True,
+            )
+            qwen_stats_array = (
+                qwen_token_embeddings if qwen_has_sequence_inputs else qwen_embeds
+            )
+            self.standardization_stats = _compute_standardization_stats_from_arrays(
+                qwen_stats_array,
+                target_buffers,
+                self.standardization_config.eps,
+                threads=self.standardization_config.threads,
+            )
+            if qwen_has_sequence_inputs:
+                qwen_token_embeddings = _apply_feature_standardization(
+                    qwen_token_embeddings,
+                    self.standardization_stats.qwen_mean,
+                    self.standardization_stats.qwen_std,
+                )
+            else:
+                qwen_embeds = _apply_standardization_to_qwen_bundle(
+                    qwen_embeds,
+                    self.standardization_stats,
+                )
+            target_buffers = _apply_standardization_to_target_bundle(
+                target_buffers,
+                self.standardization_stats,
+            )
+
+        self.row_count = total_rows
+        self.has_sequence_inputs = bool(qwen_has_sequence_inputs)
+        if self.has_sequence_inputs:
+            self.token_embeddings = torch.from_numpy(qwen_token_embeddings)
+            self.token_offsets = torch.from_numpy(qwen_token_offsets)
+            self.sequence_lengths = torch.from_numpy(qwen_sequence_lengths)
+            self.inputs = None
+        else:
+            self.inputs = torch.from_numpy(qwen_embeds)
         self.input_dim = qwen_dim
         if self.target_family == "sdxl":
             self.prompt_targets = torch.from_numpy(target_buffers["prompt_embeds"])
@@ -1374,27 +2541,37 @@ class ArchiveEmbeddingDataset(Dataset):
                 "pooled_dim": self.pooled_dim,
             }
             print(
-                f"Loaded {len(self.inputs):,} aligned archive training pairs "
+                f"Loaded {self.row_count:,} aligned archive training pairs "
                 f"({self.input_dim} -> [{self.prompt_seq_len}, {self.prompt_dim}] + {self.pooled_dim})."
             )
         else:
             self.targets = torch.from_numpy(target_buffers["embedding"])
             self.target_dim = int(self.targets.shape[1])
             print(
-                f"Loaded {len(self.inputs):,} aligned archive training pairs "
+                f"Loaded {self.row_count:,} aligned archive training pairs "
                 f"({self.input_dim} -> {self.target_dim})."
             )
 
     def __len__(self):
-        return len(self.inputs)
+        return self.row_count
 
     def __getitem__(self, idx):
+        if self.has_sequence_inputs:
+            token_start = int(self.token_offsets[idx].item())
+            token_end = int(self.token_offsets[idx + 1].item())
+            qwen_item = {
+                "format": "token_sequence",
+                "token_embeddings": self.token_embeddings[token_start:token_end],
+                "sequence_length": self.sequence_lengths[idx],
+            }
+        else:
+            qwen_item = self.inputs[idx]
         if self.target_family == "sdxl":
-            return self.inputs[idx], {
+            return qwen_item, {
                 "prompt_embeds": self.prompt_targets[idx],
                 "pooled_prompt_embeds": self.pooled_targets[idx],
             }
-        return self.inputs[idx], {"embedding": self.targets[idx]}
+        return qwen_item, {"embedding": self.targets[idx]}
 
 
 class ArchiveChunkReader:
@@ -1405,9 +2582,16 @@ class ArchiveChunkReader:
         target_layout=None,
         max_samples=None,
         archive_threads=0,
+        standardization_config=None,
     ):
         self.target_family = target_layout.family if target_layout is not None else "sd"
         self.archive_threads = max(0, int(archive_threads))
+        self.standardization_config = (
+            standardization_config or EmbeddingStandardizationConfig()
+        )
+        self.standardization_stats = None
+        self.uses_standardized_cache = False
+        self.split_caches = {}
         self.qwen_archives = _list_npz_archives(qwen_archive_dir, "archive_")
         self.clip_archives, resolved_target_dir = _resolve_target_archives(
             target_layout, clip_archive_dir
@@ -1460,14 +2644,110 @@ class ArchiveChunkReader:
                     else:
                         self.target_dim = int(bundle["embedding"].shape[1])
 
+        common_total = min(qwen_total, clip_total)
         if qwen_total != clip_total:
-            raise RuntimeError(
-                f"Archive row mismatch: {qwen_total:,} Qwen rows vs {clip_total:,} CLIP rows"
+            if max_samples is None or max_samples > common_total:
+                raise RuntimeError(
+                    f"Archive row mismatch: {qwen_total:,} Qwen rows vs {clip_total:,} CLIP rows"
+                )
+            print(
+                "Archive row mismatch tolerated because TRAIN_MAX_SAMPLES caps "
+                f"the run to the common prefix: {qwen_total:,} Qwen rows vs "
+                f"{clip_total:,} target rows, using {max_samples:,} rows.",
+                flush=True,
             )
 
-        self.total_rows = qwen_total
+        self.total_rows = common_total
         if max_samples is not None:
             self.total_rows = min(self.total_rows, max_samples)
+
+        if self.standardization_config.enabled:
+            cache_paths = None
+            cache_result = None
+            if self.standardization_config.cache_archives:
+                cache_paths = _standardized_archive_cache_paths(
+                    self.qwen_archives,
+                    self.clip_archives,
+                    self.total_rows,
+                    self.target_family,
+                    self.standardization_config,
+                    target_layout,
+                    clip_archive_dir,
+                )
+                cache_result = _load_standardized_archive_cache(
+                    cache_paths,
+                    self.qwen_archives,
+                    self.clip_archives,
+                    self.total_rows,
+                )
+                if cache_result is not None:
+                    self.standardization_stats = cache_result["stats"]
+                    self.qwen_archives = cache_result["qwen_archives"]
+                    self.clip_archives = cache_result["clip_archives"]
+                    resolved_target_dir = cache_result["target_dir"]
+                    self.uses_standardized_cache = True
+                    print(
+                        f"Using standardized archive cache: {cache_result['root']}",
+                        flush=True,
+                    )
+
+            if self.standardization_stats is None:
+                print(
+                    "Preparing streaming embedding standardization stats...",
+                    flush=True,
+                )
+                self.standardization_stats = (
+                    _compute_standardization_stats_from_archives(
+                        self.qwen_archives,
+                        self.clip_archives,
+                        self.total_rows,
+                        self.target_family,
+                        self.standardization_config.eps,
+                        threads=self.standardization_config.threads,
+                    )
+                )
+                if self.standardization_config.cache_archives:
+                    cache_result = _materialize_standardized_archive_cache(
+                        cache_paths,
+                        self.qwen_archives,
+                        self.clip_archives,
+                        self.total_rows,
+                        self.target_family,
+                        self.standardization_stats,
+                        self.standardization_config,
+                    )
+                    self.standardization_stats = cache_result["stats"]
+                    self.qwen_archives = cache_result["qwen_archives"]
+                    self.clip_archives = cache_result["clip_archives"]
+                    resolved_target_dir = cache_result["target_dir"]
+                    self.uses_standardized_cache = True
+                    print(
+                        f"Finished standardized archive cache: {cache_result['root']}",
+                        flush=True,
+                    )
+
+            if self.uses_standardized_cache:
+                self.qwen_index_arrays = []
+                self.qwen_counts = []
+                self.clip_counts = []
+                cached_qwen_total = 0
+                for path in self.qwen_archives:
+                    with np.load(path, allow_pickle=False) as data:
+                        indices = data["indices"].astype(np.int64, copy=False)
+                        self.qwen_index_arrays.append(indices)
+                        self.qwen_counts.append(len(indices))
+                        cached_qwen_total += len(indices)
+                cached_clip_total = 0
+                for path in self.clip_archives:
+                    with np.load(path, allow_pickle=False) as data:
+                        self.clip_counts.append(len(data["indices"]))
+                        cached_clip_total += len(data["indices"])
+                if cached_qwen_total != cached_clip_total:
+                    raise RuntimeError(
+                        "Standardized archive cache row mismatch: "
+                        f"{cached_qwen_total:,} Qwen rows vs {cached_clip_total:,} target rows"
+                    )
+                self.total_rows = min(self.total_rows, cached_qwen_total)
 
     def summarize(self, val_fraction, seed, batch_size):
         train_rows = 0
@@ -1514,16 +2794,18 @@ class ArchiveChunkReader:
 
     def _load_qwen_archive(self, path):
         with np.load(path, allow_pickle=False) as data:
+            inputs = _load_qwen_bundle_from_archive(data)
             return {
                 "indices": data["indices"].astype(np.int64, copy=False),
-                "inputs": _load_qwen_bundle_from_archive(data),
+                "inputs": inputs,
             }
 
     def _load_target_archive(self, path):
         with np.load(path, allow_pickle=False) as data:
+            targets = _load_target_bundle_from_archive(data, self.target_family)
             return {
                 "indices": data["indices"].astype(np.int64, copy=False),
-                "targets": _load_target_bundle_from_archive(data, self.target_family),
+                "targets": targets,
             }
 
     def iter_chunks(self):
@@ -1610,6 +2892,62 @@ class ArchiveChunkReader:
             if executor is not None:
                 executor.shutdown(wait=True)
 
+    def get_split_cache(self, split, val_fraction, split_seed):
+        cache_key = (split, float(val_fraction), int(split_seed))
+        if cache_key in self.split_caches:
+            return self.split_caches[cache_key]
+        if split != "val":
+            raise ValueError(
+                "Streaming split cache is currently only supported for validation."
+            )
+
+        qwen_parts = []
+        target_parts = []
+        rows = 0
+        scanned_rows = 0
+        cache_start = perf_counter()
+        last_emit_s = cache_start
+        print(
+            "Building dense streaming validation cache "
+            f"for split={val_fraction:.4f} seed={split_seed}...",
+            flush=True,
+        )
+        for indices, q_chunk_np, target_chunk_np in self.iter_chunks():
+            scanned_rows += len(indices)
+            val_mask = _split_mask_from_indices(indices, val_fraction, split_seed)
+            local_count = int(val_mask.sum())
+            if local_count > 0:
+                local_np_indices = np.flatnonzero(val_mask).astype(np.int64, copy=False)
+                qwen_parts.append(_select_qwen_bundle_np(q_chunk_np, local_np_indices))
+                target_parts.append(
+                    _select_target_bundle_np(target_chunk_np, local_np_indices)
+                )
+                rows += local_count
+            now_s = perf_counter()
+            if now_s - last_emit_s >= 30.0:
+                print(
+                    "Validation cache progress | "
+                    f"rows={rows:,} | scanned={scanned_rows:,}/{self.total_rows:,} | "
+                    f"elapsed={now_s - cache_start:.1f}s",
+                    flush=True,
+                )
+                last_emit_s = now_s
+
+        cache = {
+            "qwen": _concat_qwen_bundles_np(*qwen_parts),
+            "target": _concat_target_bundles_np(*target_parts),
+            "rows": rows,
+            "scanned_rows": scanned_rows,
+        }
+        self.split_caches[cache_key] = cache
+        print(
+            "Validation cache ready | "
+            f"rows={rows:,} | scanned={scanned_rows:,} | "
+            f"elapsed={perf_counter() - cache_start:.1f}s",
+            flush=True,
+        )
+        return cache
+
 
 def _split_dataset(dataset, val_fraction, seed):
     total_rows = len(dataset)
@@ -1660,7 +2998,7 @@ def _evaluate(
 
     with torch.inference_mode():
         for batch_qwen, batch_target in dataloader:
-            batch_qwen = batch_qwen.to(device, non_blocking=pin_memory)
+            batch_qwen = _move_qwen_bundle_to_device(batch_qwen, device, pin_memory)
             batch_target = _move_target_bundle_to_device(
                 batch_target, device, pin_memory
             )
@@ -1670,7 +3008,7 @@ def _evaluate(
                 dtype=torch.float16,
                 enabled=amp_enabled,
             ):
-                predictions = model(batch_qwen)
+                predictions = _forward_qwen_model(model, batch_qwen)
                 _, batch_metrics = _compute_loss_metrics(
                     predictions,
                     batch_target,
@@ -1722,6 +3060,9 @@ def _save_best_checkpoint(
     target_dim,
     hidden_dim,
 ):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
@@ -1731,6 +3072,7 @@ def _save_best_checkpoint(
             "input_dim": input_dim,
             "target_dim": target_dim,
             "hidden_dim": hidden_dim,
+            "embedding_standardization": _standardization_checkpoint_payload(model),
             "model_state_dict": {
                 name: tensor.detach().cpu().clone()
                 for name, tensor in model.state_dict().items()
@@ -1740,12 +3082,213 @@ def _save_best_checkpoint(
     )
 
 
+def _save_resume_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    *,
+    epoch,
+    global_step,
+    best_epoch,
+    best_metric_name,
+    best_metric,
+    input_dim,
+    target_dim,
+    hidden_dim,
+):
+    if not path:
+        return None
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "best_epoch": int(best_epoch),
+        "best_metric_name": best_metric_name,
+        "best_metric": float(best_metric),
+        "input_dim": input_dim,
+        "target_dim": target_dim,
+        "hidden_dim": hidden_dim,
+        "embedding_standardization": _standardization_checkpoint_payload(model),
+        "model_state_dict": {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()
+        },
+        "optimizer_state_dict": (
+            optimizer.state_dict() if optimizer is not None else None
+        ),
+        "scheduler_state_dict": (
+            scheduler.state_dict() if scheduler is not None else None
+        ),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+    }
+    torch.save(payload, path)
+    return path
+
+
+def _restore_resume_checkpoint(path, model, optimizer, scheduler, scaler, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    _restore_standardization_from_payload(
+        model,
+        checkpoint.get("embedding_standardization"),
+    )
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer is not None and optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    scaler_state = checkpoint.get("scaler_state_dict")
+    if scaler is not None and scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+    return checkpoint
+
+
+def _resume_global_step_from_scheduler(global_step, scheduler):
+    if scheduler is None:
+        return int(global_step)
+    scheduler_step = max(0, int(getattr(scheduler, "last_epoch", -1)))
+    return max(int(global_step), scheduler_step)
+
+
+def _resume_epoch_position(global_step, steps_per_epoch, epochs):
+    if steps_per_epoch <= 0:
+        return 0, 0
+    completed_epochs, steps_into_epoch = divmod(
+        max(0, int(global_step)), steps_per_epoch
+    )
+    if completed_epochs >= epochs:
+        return epochs, 0
+    return completed_epochs, steps_into_epoch
+
+
+def _remove_resume_checkpoint(path):
+    if not path:
+        return
+    with suppress(FileNotFoundError):
+        os.remove(path)
+
+
 def _restore_best_checkpoint(model, path, device):
     if not os.path.exists(path):
         return None
-    best_checkpoint = torch.load(path, map_location=device)
+    best_checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint["model_state_dict"])
+    _restore_standardization_from_payload(
+        model,
+        best_checkpoint.get("embedding_standardization"),
+    )
     return best_checkpoint
+
+
+def _load_training_warm_start(path, device):
+    if not path:
+        return None, None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Warm-start path does not exist: {path}")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".gguf"):
+        loaded_model, metadata = load_projector_from_gguf(path, device="cpu")
+        state_dict = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in loaded_model.state_dict().items()
+        }
+        source = {
+            "source_path": path,
+            "source_kind": "gguf",
+            "metadata": metadata,
+        }
+        return state_dict, source
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    state_dict = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in state_dict.items()
+        if torch.is_tensor(tensor)
+    }
+    source = {
+        "source_path": path,
+        "source_kind": "checkpoint",
+        "epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
+    }
+    if isinstance(checkpoint, dict) and "embedding_standardization" in checkpoint:
+        source["embedding_standardization"] = checkpoint["embedding_standardization"]
+    return state_dict, source
+
+
+def _apply_training_warm_start(model, path, device, strict=True):
+    state_dict, source = _load_training_warm_start(path, device)
+    if state_dict is None:
+        return None
+
+    if strict:
+        model.load_state_dict(state_dict)
+        print(
+            f"Applied warm start from {source['source_kind']} {source['source_path']}",
+            flush=True,
+        )
+    else:
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        print(
+            "Applied warm start "
+            f"from {source['source_kind']} {source['source_path']} | "
+            f"missing={len(incompatible.missing_keys)} | "
+            f"unexpected={len(incompatible.unexpected_keys)}",
+            flush=True,
+        )
+    if source.get("epoch") is not None:
+        print(f"Warm-start checkpoint epoch: {source['epoch']}", flush=True)
+    return source
+
+
+def _rescale_output_calibrator_gains(
+    model,
+    *,
+    prompt_gain_scale=1.0,
+    pooled_gain_scale=1.0,
+):
+    prompt_gain_scale = float(prompt_gain_scale)
+    pooled_gain_scale = float(pooled_gain_scale)
+    if abs(prompt_gain_scale - 1.0) < 1e-12 and abs(pooled_gain_scale - 1.0) < 1e-12:
+        return
+
+    prompt_calibrator = getattr(model, "prompt_output_calibrator", None)
+    pooled_calibrator = getattr(model, "pooled_output_calibrator", None)
+    if prompt_calibrator is None or pooled_calibrator is None:
+        raise ValueError(
+            "Calibrator gain rescaling requires an SDXL projector with "
+            "use_output_calibrator enabled."
+        )
+
+    with torch.no_grad():
+        prompt_before = prompt_calibrator.gain.float().mean().item()
+        pooled_before = pooled_calibrator.gain.float().mean().item()
+        prompt_calibrator.gain.mul_(prompt_gain_scale)
+        pooled_calibrator.gain.mul_(pooled_gain_scale)
+        prompt_after = prompt_calibrator.gain.float().mean().item()
+        pooled_after = pooled_calibrator.gain.float().mean().item()
+
+    print(
+        "Rescaled output calibrator gains | "
+        f"prompt x={prompt_gain_scale:.6f} ({prompt_before:.6f}->{prompt_after:.6f}) | "
+        f"pooled x={pooled_gain_scale:.6f} ({pooled_before:.6f}->{pooled_after:.6f})",
+        flush=True,
+    )
 
 
 def _run_archive_pass(
@@ -1772,10 +3315,14 @@ def _run_archive_pass(
     progress_every=0,
     progress_seconds=0.0,
     progress_callback=None,
+    train_step_callback=None,
+    skip_steps=0,
     prompt_loss_weight=1.0,
     pooled_loss_weight=1.0,
     sdxl_loss_config=None,
     timing_enabled=False,
+    apply_batch_standardization=False,
+    stream_val_cache=False,
 ):
     is_train = split == "train"
     if is_train:
@@ -1789,6 +3336,9 @@ def _run_archive_pass(
     rows_done = 0
     pass_start = perf_counter()
     last_emit_s = pass_start
+    skipped_steps = max(0, int(skip_steps)) if is_train else 0
+    skip_total = skipped_steps
+    last_skip_emit_s = pass_start
     instrumentation = None
     if timing_enabled:
         instrumentation = {
@@ -1800,6 +3350,18 @@ def _run_archive_pass(
             "copy_s": 0.0,
             "compute_s": 0.0,
         }
+    standardization_tensors = None
+    if apply_batch_standardization:
+        standardization_tensors = _standardization_tensors_for_device(model, device)
+
+    def _pass_limit_reached():
+        if max_steps_remaining <= 0:
+            return False
+        return (
+            used_steps >= max_steps_remaining
+            if is_train
+            else steps >= max_steps_remaining
+        )
 
     def _run_batch(batch_qwen, batch_target):
         nonlocal steps, used_steps, rows_done, last_emit_s
@@ -1830,6 +3392,16 @@ def _run_archive_pass(
         compute_start_event, compute_end_event, compute_start_s = _start_timing_window(
             device, timing_enabled
         )
+
+        if standardization_tensors is not None:
+            batch_qwen = _apply_qwen_standardization_torch(
+                batch_qwen,
+                standardization_tensors,
+            )
+            batch_target = _apply_target_standardization_torch(
+                batch_target,
+                standardization_tensors,
+            )
 
         with torch.autocast(
             device_type=device.type,
@@ -1863,6 +3435,8 @@ def _run_archive_pass(
             if scheduler is not None:
                 scheduler.step()
             used_steps += 1
+            if train_step_callback is not None:
+                train_step_callback()
         if instrumentation is not None:
             instrumentation["compute_s"] += _finish_timing_window(
                 compute_start_event, compute_end_event, compute_start_s
@@ -1896,13 +3470,51 @@ def _run_archive_pass(
             )
             last_emit_s = perf_counter()
 
-        return (
-            is_train and max_steps_remaining > 0 and used_steps >= max_steps_remaining
-        )
+        return _pass_limit_reached()
+
+    def _consume_batch(batch_qwen, batch_target):
+        nonlocal skipped_steps, last_skip_emit_s
+        if is_train and skipped_steps > 0:
+            skipped_steps -= 1
+            done = skip_total - skipped_steps
+            if skipped_steps == 0 or _should_emit_progress(
+                done, last_skip_emit_s, progress_every, progress_seconds
+            ):
+                now_s = perf_counter()
+                elapsed_s = max(now_s - pass_start, 1e-6)
+                print(
+                    "Resume skip progress | "
+                    f"batch {done}/{skip_total} "
+                    f"({100.0 * done / max(skip_total, 1):.1f}%) | "
+                    f"{done / elapsed_s:.1f} batch/s",
+                    flush=True,
+                )
+                last_skip_emit_s = now_s
+            return False
+        return _run_batch(batch_qwen, batch_target)
 
     context = torch.enable_grad() if is_train else torch.inference_mode()
     pending_qwen = None
     pending_target = None
+
+    if not is_train and stream_val_cache:
+        cache = reader.get_split_cache(split, val_fraction, split_seed)
+        q_cached = _qwen_bundle_from_numpy(cache["qwen"])
+        target_cached = _bundle_from_numpy(cache["target"])
+        cached_rows = _qwen_rows(q_cached)
+        with context:
+            for start in range(0, cached_rows, batch_size):
+                end = min(start + batch_size, cached_rows)
+                stop_requested = _consume_batch(
+                    _slice_qwen_bundle(q_cached, start, end),
+                    _slice_target_bundle(target_cached, start, end),
+                )
+                if stop_requested:
+                    break
+        metrics = _finalize_metric_sums(metric_sums, steps)
+        metrics.update(_finalize_stream_instrumentation(instrumentation))
+        return metrics, used_steps
+
     chunk_iterator = iter(reader.iter_chunks())
     with context:
         while True:
@@ -1922,19 +3534,23 @@ def _run_archive_pass(
             if local_count == 0:
                 continue
 
-            q_chunk = _qwen_bundle_from_numpy(q_chunk_np)
-            target_chunk = _bundle_from_numpy(target_chunk_np)
-            local_indices = torch.from_numpy(
-                np.flatnonzero(local_mask).astype(np.int64, copy=False)
-            )
+            local_np_indices = np.flatnonzero(local_mask).astype(np.int64, copy=False)
 
             if is_train:
+                q_chunk = _qwen_bundle_from_numpy(q_chunk_np)
+                target_chunk = _bundle_from_numpy(target_chunk_np)
+                local_indices = torch.from_numpy(local_np_indices)
                 order = local_indices[torch.randperm(local_indices.numel())]
+                q_local = _select_qwen_bundle(q_chunk, order)
+                target_local = _select_target_bundle(target_chunk, order)
             else:
-                order = local_indices
+                q_local = _qwen_bundle_from_numpy(
+                    _select_qwen_bundle_np(q_chunk_np, local_np_indices)
+                )
+                target_local = _bundle_from_numpy(
+                    _select_target_bundle_np(target_chunk_np, local_np_indices)
+                )
 
-            q_local = _select_qwen_bundle(q_chunk, order)
-            target_local = _select_target_bundle(target_chunk, order)
             if pending_qwen is not None:
                 q_local = _concat_qwen_bundles(pending_qwen, q_local)
                 target_local = _concat_target_bundles(pending_target, target_local)
@@ -1945,7 +3561,7 @@ def _run_archive_pass(
             limit = (q_local_rows // batch_size) * batch_size
             stop_requested = False
             for start in range(0, limit, batch_size):
-                stop_requested = _run_batch(
+                stop_requested = _consume_batch(
                     _slice_qwen_bundle(q_local, start, start + batch_size),
                     _slice_target_bundle(target_local, start, start + batch_size),
                 )
@@ -1953,7 +3569,9 @@ def _run_archive_pass(
                     break
 
             if stop_requested:
-                del q_chunk, target_chunk, local_indices, order, q_local, target_local
+                if is_train:
+                    del q_chunk, target_chunk, local_indices, order
+                del q_local, target_local
                 break
 
             if limit < q_local_rows:
@@ -1962,18 +3580,16 @@ def _run_archive_pass(
                     key: value[limit:].clone() for key, value in target_local.items()
                 }
 
-            del q_chunk, target_chunk, local_indices, order, q_local, target_local
+            if is_train:
+                del q_chunk, target_chunk, local_indices, order
+            del q_local, target_local
 
         if (
             pending_qwen is not None
             and _qwen_rows(pending_qwen) > 0
-            and (
-                not is_train
-                or max_steps_remaining <= 0
-                or used_steps < max_steps_remaining
-            )
+            and not _pass_limit_reached()
         ):
-            _run_batch(pending_qwen, pending_target)
+            _consume_batch(pending_qwen, pending_target)
 
     metrics = _finalize_metric_sums(metric_sums, steps)
     metrics.update(_finalize_stream_instrumentation(instrumentation))
@@ -2011,6 +3627,19 @@ def train_projector(
     )
     max_samples = None if max_samples <= 0 else max_samples
     archive_in_memory_limit = _env_int("TRAIN_ARCHIVE_IN_MEMORY_LIMIT", 100_000)
+    archive_mode = _env_str("TRAIN_ARCHIVE_MODE", "auto").strip().lower()
+    if archive_mode not in {
+        "auto",
+        "stream",
+        "streaming",
+        "memory",
+        "in_memory",
+        "in-memory",
+    }:
+        raise ValueError(
+            "TRAIN_ARCHIVE_MODE must be one of: auto, stream, streaming, memory, in_memory, in-memory. "
+            f"Got '{archive_mode}'."
+        )
     archive_threads = _env_int("TRAIN_ARCHIVE_THREADS", 2)
     hidden_dim = _env_int("TRAIN_HIDDEN_DIM", 4096)
     sdxl_prompt_token_dim = _env_int("TRAIN_SDXL_PROMPT_TOKEN_DIM", 256)
@@ -2024,7 +3653,19 @@ def train_projector(
     sdxl_resampler_ff_mult = _env_int("TRAIN_SDXL_RESAMPLER_FF_MULT", 4)
     sdxl_resampler_pooled_queries = _env_int("TRAIN_SDXL_RESAMPLER_POOLED_QUERIES", 1)
     sdxl_use_output_calibrator = _env_bool("TRAIN_SDXL_USE_OUTPUT_CALIBRATOR", False)
+    sdxl_use_spectral_norm = _env_bool("TRAIN_SDXL_SPECTRAL_NORM", False)
+    warm_start_path = _env_str("TRAIN_WARM_START_PATH", "").strip()
+    warm_start_strict = _env_bool("TRAIN_WARM_START_STRICT", True)
+    sdxl_prompt_calibrator_gain_scale = _env_float(
+        "TRAIN_SDXL_PROMPT_OUTPUT_CALIBRATOR_GAIN_SCALE", 1.0
+    )
+    sdxl_pooled_calibrator_gain_scale = _env_float(
+        "TRAIN_SDXL_POOLED_OUTPUT_CALIBRATOR_GAIN_SCALE", 1.0
+    )
     val_fraction = _env_float("TRAIN_VAL_SPLIT", 0.1)
+    val_max_steps = _env_int("TRAIN_VAL_MAX_STEPS", 0)
+    val_every_n_epochs = max(1, _env_int("TRAIN_VAL_EVERY_N_EPOCHS", 1))
+    stream_val_cache = _env_bool("TRAIN_STREAM_VAL_CACHE", False)
     split_seed = _env_int("TRAIN_SPLIT_SEED", 1337)
     max_lr = _env_float("TRAIN_MAX_LR", 1e-4)
     weight_decay = _env_float("TRAIN_WEIGHT_DECAY", 1e-5)
@@ -2039,8 +3680,18 @@ def train_projector(
     sdxl_monitor_config = (
         _build_sdxl_monitor_config() if target_family == "sdxl" else None
     )
+    standardization_config = _build_embedding_standardization_config(
+        default_threads=max(archive_threads, 1),
+    )
     best_checkpoint_path = os.getenv(
         "TRAIN_BEST_CHECKPOINT", target_layout.best_checkpoint_path
+    )
+    resume_checkpoint_path = _env_str("TRAIN_RESUME_CHECKPOINT", "").strip()
+    auto_resume = _env_bool("TRAIN_AUTO_RESUME", False)
+    resume_available = bool(
+        auto_resume
+        and resume_checkpoint_path
+        and os.path.exists(resume_checkpoint_path)
     )
     num_workers = _env_int("TRAIN_NUM_WORKERS", 0)
     pin_memory = device.type == "cuda"
@@ -2058,11 +3709,14 @@ def train_projector(
             sdxl_projector_arch,
             qwen_has_sequence_inputs,
         )
-    stream_archives = use_archives and (
-        qwen_has_sequence_inputs
-        or max_samples is None
-        or max_samples > archive_in_memory_limit
-    )
+    if archive_mode in {"stream", "streaming"}:
+        stream_archives = use_archives
+    elif archive_mode in {"memory", "in_memory", "in-memory"}:
+        stream_archives = False
+    else:
+        stream_archives = use_archives and (
+            max_samples is None or max_samples > archive_in_memory_limit
+        )
     if stream_archives:
         reader = ArchiveChunkReader(
             qwen_archive_dir=os.path.join(qwen_archive_root, "archive"),
@@ -2070,8 +3724,14 @@ def train_projector(
             target_layout=target_layout,
             max_samples=max_samples,
             archive_threads=archive_threads,
+            standardization_config=standardization_config,
         )
         split_summary = reader.summarize(val_fraction, split_seed, batch_size)
+        val_report_steps = split_summary["val_steps"]
+        val_report_rows = split_summary["val_rows"]
+        if val_max_steps > 0 and val_report_steps > 0:
+            val_report_steps = min(val_report_steps, val_max_steps)
+            val_report_rows = min(val_report_rows, val_report_steps * batch_size)
         if target_family == "sdxl":
             model = _build_sdxl_projector(
                 sdxl_projector_arch,
@@ -2091,13 +3751,31 @@ def train_projector(
                 pooled_query_count=sdxl_resampler_pooled_queries,
                 has_sequence_inputs=reader.has_sequence_inputs,
                 use_output_calibrator=sdxl_use_output_calibrator,
+                use_spectral_norm=sdxl_use_spectral_norm,
             ).to(device)
+            if warm_start_path and not resume_available:
+                _apply_training_warm_start(
+                    model,
+                    warm_start_path,
+                    device,
+                    strict=warm_start_strict,
+                )
+                _rescale_output_calibrator_gains(
+                    model,
+                    prompt_gain_scale=sdxl_prompt_calibrator_gain_scale,
+                    pooled_gain_scale=sdxl_pooled_calibrator_gain_scale,
+                )
         else:
             model = QwenToSDProjector(
                 qwen_dim=reader.input_dim,
                 sd_dim=reader.target_dim,
                 hidden_dim=hidden_dim,
             ).to(device)
+        _attach_standardization_to_model(
+            model,
+            standardization_config,
+            reader.standardization_stats,
+        )
         criterion = _build_pointwise_criterion(target_family, sdxl_loss_config)
         optimizer = optim.AdamW(
             model.parameters(), lr=max_lr, weight_decay=weight_decay
@@ -2117,6 +3795,59 @@ def train_projector(
                 final_div_factor=1e4,
             )
 
+        start_epoch = 0
+        global_step = 0
+        best_metric = float("inf")
+        best_epoch = 0
+        best_metric_name = "mse"
+        resume_skip_train_steps = 0
+        if resume_available:
+            resume_checkpoint = _restore_resume_checkpoint(
+                resume_checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                device,
+            )
+            start_epoch = int(resume_checkpoint.get("epoch", 0))
+            restored_global_step = int(resume_checkpoint.get("global_step", 0))
+            global_step = _resume_global_step_from_scheduler(
+                restored_global_step,
+                scheduler,
+            )
+            restored_epoch = int(resume_checkpoint.get("epoch", 0))
+            start_epoch, resume_skip_train_steps = _resume_epoch_position(
+                global_step,
+                split_summary["train_steps"],
+                epochs,
+            )
+            best_metric = float(resume_checkpoint.get("best_metric", float("inf")))
+            best_epoch = int(resume_checkpoint.get("best_epoch", 0))
+            best_metric_name = resume_checkpoint.get("best_metric_name", "mse")
+            print(
+                f"Resumed training state from {resume_checkpoint_path} | "
+                f"epoch={start_epoch + 1} | global_step={global_step}",
+                flush=True,
+            )
+            if global_step != restored_global_step:
+                print(
+                    "Adjusted resumed global_step to match scheduler progress "
+                    f"({restored_global_step} -> {global_step}).",
+                    flush=True,
+                )
+            if start_epoch != restored_epoch:
+                print(
+                    "Adjusted resumed epoch to match completed train steps "
+                    f"({restored_epoch + 1} -> {start_epoch + 1}).",
+                    flush=True,
+                )
+            if resume_skip_train_steps > 0:
+                print(
+                    f"Skipping {resume_skip_train_steps} already-completed train batch(es) in resumed epoch.",
+                    flush=True,
+                )
+
         print(
             f"Starting streaming training on {split_summary['train_rows']:,} train samples"
             + (
@@ -2132,6 +3863,32 @@ def train_projector(
             )
         if target_family == "sdxl":
             print(f"SDXL projector architecture: {sdxl_projector_arch}")
+        if standardization_config.enabled:
+            print(
+                "Embedding standardization: enabled | "
+                f"eps={standardization_config.eps:.1e} | "
+                f"threads={standardization_config.threads}",
+                flush=True,
+            )
+            if standardization_config.cache_archives:
+                print(
+                    "Standardized archive cache: enabled | mode="
+                    + (
+                        "reused-on-disk"
+                        if reader.uses_standardized_cache
+                        else "build-or-reuse"
+                    ),
+                    flush=True,
+                )
+            print(
+                "Streaming standardization mode: "
+                + (
+                    "loaded-from-disk-cache."
+                    if reader.uses_standardized_cache
+                    else "batchwise on-device."
+                ),
+                flush=True,
+            )
         print(
             f"Optimizer=AdamW(max_lr={max_lr}, weight_decay={weight_decay}) | "
             f"hidden_dim={hidden_dim} | val_split={val_fraction:.2f} | grad_clip={grad_clip}"
@@ -2141,6 +3898,15 @@ def train_projector(
                 else ""
             )
         )
+        if split_summary["val_rows"] > 0:
+            print(
+                "Streaming validation: "
+                f"full_rows={split_summary['val_rows']:,} | "
+                f"full_steps={split_summary['val_steps']:,} | "
+                f"run_rows~{val_report_rows:,} | run_steps~{val_report_steps:,} | "
+                f"every_n_epochs={val_every_n_epochs} | dense_cache={stream_val_cache}",
+                flush=True,
+            )
         if sdxl_loss_config is not None:
             print(
                 "SDXL loss config: "
@@ -2178,51 +3944,24 @@ def train_projector(
             f"Progress updates every {progress_every} batch(es) or {progress_seconds:.0f}s.",
             flush=True,
         )
+
+        def _record_archive_train_step():
+            nonlocal global_step
+            global_step += 1
+
         if timing_enabled:
             print(
                 "Timing instrumentation enabled: batch_rows, chunk_rows, chunk_wait_ms, copy_ms, gpu_ms.",
                 flush=True,
             )
-
-        global_step = 0
-        best_metric = float("inf")
-        best_epoch = 0
-        for epoch in range(epochs):
-            steps_left = max(0, max_steps - global_step) if max_steps > 0 else 0
-            train_metrics, used_steps = _run_archive_pass(
-                reader,
-                model,
-                criterion,
-                target_family,
-                device,
-                amp_enabled,
-                pin_memory,
-                batch_size,
-                val_fraction,
-                split_seed,
-                "train",
-                optimizer=optimizer,
-                scaler=scaler,
-                scheduler=scheduler,
-                grad_clip=grad_clip,
-                max_steps_remaining=steps_left,
-                epoch_num=epoch + 1,
-                epochs=epochs,
-                total_rows=split_summary["train_rows"],
-                total_steps=split_summary["train_steps"],
-                progress_every=progress_every,
-                progress_seconds=progress_seconds,
-                progress_callback=progress_callback,
-                prompt_loss_weight=prompt_loss_weight,
-                pooled_loss_weight=pooled_loss_weight,
-                sdxl_loss_config=sdxl_loss_config,
-                timing_enabled=timing_enabled,
-            )
-            global_step += used_steps
-
-            val_metrics = None
-            if split_summary["val_rows"] > 0:
-                val_metrics, _ = _run_archive_pass(
+        try:
+            for epoch in range(start_epoch, epochs):
+                if max_steps > 0 and global_step >= max_steps:
+                    break
+                steps_left = max(0, max_steps - global_step) if max_steps > 0 else 0
+                if max_steps > 0 and steps_left == 0:
+                    break
+                train_metrics, used_steps = _run_archive_pass(
                     reader,
                     model,
                     criterion,
@@ -2233,62 +3972,166 @@ def train_projector(
                     batch_size,
                     val_fraction,
                     split_seed,
-                    "val",
+                    "train",
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    scheduler=scheduler,
+                    grad_clip=grad_clip,
+                    max_steps_remaining=steps_left,
                     epoch_num=epoch + 1,
                     epochs=epochs,
-                    total_rows=split_summary["val_rows"],
-                    total_steps=split_summary["val_steps"],
+                    total_rows=split_summary["train_rows"],
+                    total_steps=split_summary["train_steps"],
                     progress_every=progress_every,
                     progress_seconds=progress_seconds,
                     progress_callback=progress_callback,
+                    train_step_callback=_record_archive_train_step,
+                    skip_steps=resume_skip_train_steps,
                     prompt_loss_weight=prompt_loss_weight,
                     pooled_loss_weight=pooled_loss_weight,
                     sdxl_loss_config=sdxl_loss_config,
                     timing_enabled=timing_enabled,
+                    apply_batch_standardization=(
+                        standardization_config.enabled
+                        and not reader.uses_standardized_cache
+                    ),
                 )
+                resume_skip_train_steps = 0
 
-            current_lr = optimizer.param_groups[0]["lr"]
-            monitor_source_metrics = (
-                train_metrics if val_metrics is None else val_metrics
-            )
-            monitor_value, monitor_name = _compute_monitor_metric(
-                target_family,
-                monitor_source_metrics,
-                sdxl_monitor_config,
-            )
-            monitor_source_metrics["monitor"] = monitor_value
-            monitor_source_metrics["monitor_name"] = monitor_name
-            if monitor_value < best_metric:
-                best_metric = monitor_value
-                best_epoch = epoch + 1
-                _save_best_checkpoint(
+                val_metrics = None
+                run_validation = (
+                    split_summary["val_rows"] > 0
+                    and val_every_n_epochs > 0
+                    and (epoch + 1) % val_every_n_epochs == 0
+                )
+                if run_validation:
+                    val_metrics, _ = _run_archive_pass(
+                        reader,
+                        model,
+                        criterion,
+                        target_family,
+                        device,
+                        amp_enabled,
+                        pin_memory,
+                        batch_size,
+                        val_fraction,
+                        split_seed,
+                        "val",
+                        epoch_num=epoch + 1,
+                        epochs=epochs,
+                        total_rows=val_report_rows,
+                        total_steps=val_report_steps,
+                        progress_every=progress_every,
+                        progress_seconds=progress_seconds,
+                        progress_callback=progress_callback,
+                        train_step_callback=None,
+                        skip_steps=0,
+                        max_steps_remaining=val_max_steps,
+                        prompt_loss_weight=prompt_loss_weight,
+                        pooled_loss_weight=pooled_loss_weight,
+                        sdxl_loss_config=sdxl_loss_config,
+                        timing_enabled=timing_enabled,
+                        apply_batch_standardization=(
+                            standardization_config.enabled
+                            and not reader.uses_standardized_cache
+                        ),
+                        stream_val_cache=stream_val_cache,
+                    )
+
+                current_lr = optimizer.param_groups[0]["lr"]
+                monitor_source_metrics = (
+                    train_metrics if val_metrics is None else val_metrics
+                )
+                monitor_value, monitor_name = _compute_monitor_metric(
+                    target_family,
+                    monitor_source_metrics,
+                    sdxl_monitor_config,
+                )
+                monitor_source_metrics["monitor"] = monitor_value
+                monitor_source_metrics["monitor_name"] = monitor_name
+                _save_resume_checkpoint(
+                    resume_checkpoint_path,
                     model,
-                    best_checkpoint_path,
-                    best_epoch,
-                    monitor_name,
-                    best_metric,
-                    monitor_source_metrics["mse"],
-                    reader.input_dim,
-                    reader.target_dim,
-                    hidden_dim,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    best_epoch=best_epoch,
+                    best_metric_name=best_metric_name,
+                    best_metric=best_metric,
+                    input_dim=reader.input_dim,
+                    target_dim=reader.target_dim,
+                    hidden_dim=hidden_dim,
                 )
+                if monitor_value < best_metric:
+                    best_metric = monitor_value
+                    best_epoch = epoch + 1
+                    best_metric_name = monitor_name
+                    _save_best_checkpoint(
+                        model,
+                        best_checkpoint_path,
+                        best_epoch,
+                        monitor_name,
+                        best_metric,
+                        monitor_source_metrics["mse"],
+                        reader.input_dim,
+                        reader.target_dim,
+                        hidden_dim,
+                    )
+                    _save_resume_checkpoint(
+                        resume_checkpoint_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        best_epoch=best_epoch,
+                        best_metric_name=best_metric_name,
+                        best_metric=best_metric,
+                        input_dim=reader.input_dim,
+                        target_dim=reader.target_dim,
+                        hidden_dim=hidden_dim,
+                    )
 
-            should_log = (
-                (epoch + 1) % 10 == 0
-                or epoch == 0
-                or (max_steps > 0 and global_step >= max_steps)
+                should_log = (
+                    (epoch + 1) % 10 == 0
+                    or epoch == start_epoch
+                    or (max_steps > 0 and global_step >= max_steps)
+                )
+                if should_log:
+                    log_line = f"Epoch {epoch+1}/{epochs} | " + _format_epoch_metrics(
+                        "train_", train_metrics
+                    )
+                    if val_metrics is not None:
+                        log_line += " | " + _format_epoch_metrics("val_", val_metrics)
+                    log_line += f" | lr={current_lr:.6e}"
+                    print(log_line)
+
+                if max_steps > 0 and global_step >= max_steps:
+                    break
+        except KeyboardInterrupt as exc:
+            saved_path = _save_resume_checkpoint(
+                resume_checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_epoch=best_epoch,
+                best_metric_name=best_metric_name,
+                best_metric=best_metric,
+                input_dim=reader.input_dim,
+                target_dim=reader.target_dim,
+                hidden_dim=hidden_dim,
             )
-            if should_log:
-                log_line = f"Epoch {epoch+1}/{epochs} | " + _format_epoch_metrics(
-                    "train_", train_metrics
-                )
-                if val_metrics is not None:
-                    log_line += " | " + _format_epoch_metrics("val_", val_metrics)
-                log_line += f" | lr={current_lr:.6e}"
-                print(log_line)
-
-            if max_steps > 0 and global_step >= max_steps:
-                break
+            print(
+                f"Interrupted training. Progress saved to {saved_path}. Re-run to resume.",
+                flush=True,
+            )
+            raise TrainingInterrupted(saved_path) from exc
 
         best_checkpoint = _restore_best_checkpoint(model, best_checkpoint_path, device)
         if best_checkpoint is not None:
@@ -2307,6 +4150,7 @@ def train_projector(
             )
 
         print("Training complete!")
+        _remove_resume_checkpoint(resume_checkpoint_path)
         return model
 
     if use_archives:
@@ -2315,13 +4159,18 @@ def train_projector(
             clip_archive_dir=os.path.join(archive_root, "clip_archive"),
             target_layout=target_layout,
             max_samples=max_samples,
+            standardization_config=standardization_config,
         )
     else:
         if target_family != "sd":
             raise NotImplementedError(
                 "Non-archive SDXL training is not wired yet. Use archive-backed training for SDXL targets."
             )
-        dataset = ParquetEmbeddingDataset(parquet_path, max_samples=max_samples)
+        dataset = ParquetEmbeddingDataset(
+            parquet_path,
+            max_samples=max_samples,
+            standardization_config=standardization_config,
+        )
     train_dataset, val_dataset = _split_dataset(dataset, val_fraction, split_seed)
     if target_family == "sdxl":
         model = _build_sdxl_projector(
@@ -2340,15 +4189,33 @@ def train_projector(
             resampler_heads=sdxl_resampler_heads,
             resampler_ff_mult=sdxl_resampler_ff_mult,
             pooled_query_count=sdxl_resampler_pooled_queries,
-            has_sequence_inputs=False,
+            has_sequence_inputs=dataset.has_sequence_inputs,
             use_output_calibrator=sdxl_use_output_calibrator,
+            use_spectral_norm=sdxl_use_spectral_norm,
         ).to(device)
+        if warm_start_path and not resume_available:
+            _apply_training_warm_start(
+                model,
+                warm_start_path,
+                device,
+                strict=warm_start_strict,
+            )
+            _rescale_output_calibrator_gains(
+                model,
+                prompt_gain_scale=sdxl_prompt_calibrator_gain_scale,
+                pooled_gain_scale=sdxl_pooled_calibrator_gain_scale,
+            )
     else:
         model = QwenToSDProjector(
             qwen_dim=dataset.input_dim,
             sd_dim=dataset.target_dim,
             hidden_dim=hidden_dim,
         ).to(device)
+    _attach_standardization_to_model(
+        model,
+        standardization_config,
+        dataset.standardization_stats,
+    )
     criterion = _build_pointwise_criterion(target_family, sdxl_loss_config)
     optimizer = optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -2360,6 +4227,7 @@ def train_projector(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+        collate_fn=_archive_embedding_collate if use_archives else None,
     )
     val_dataloader = None
     if val_dataset is not None:
@@ -2370,6 +4238,7 @@ def train_projector(
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
+            collate_fn=_archive_embedding_collate if use_archives else None,
         )
 
     total_steps = epochs * len(train_dataloader)
@@ -2386,6 +4255,59 @@ def train_projector(
             final_div_factor=1e4,
         )
 
+    start_epoch = 0
+    global_step = 0
+    best_metric = float("inf")
+    best_epoch = 0
+    best_metric_name = "mse"
+    resume_skip_train_steps = 0
+    if resume_available:
+        resume_checkpoint = _restore_resume_checkpoint(
+            resume_checkpoint_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+        )
+        start_epoch = int(resume_checkpoint.get("epoch", 0))
+        restored_global_step = int(resume_checkpoint.get("global_step", 0))
+        global_step = _resume_global_step_from_scheduler(
+            restored_global_step,
+            scheduler,
+        )
+        restored_epoch = int(resume_checkpoint.get("epoch", 0))
+        start_epoch, resume_skip_train_steps = _resume_epoch_position(
+            global_step,
+            len(train_dataloader),
+            epochs,
+        )
+        best_metric = float(resume_checkpoint.get("best_metric", float("inf")))
+        best_epoch = int(resume_checkpoint.get("best_epoch", 0))
+        best_metric_name = resume_checkpoint.get("best_metric_name", "mse")
+        print(
+            f"Resumed training state from {resume_checkpoint_path} | "
+            f"epoch={start_epoch + 1} | global_step={global_step}",
+            flush=True,
+        )
+        if global_step != restored_global_step:
+            print(
+                "Adjusted resumed global_step to match scheduler progress "
+                f"({restored_global_step} -> {global_step}).",
+                flush=True,
+            )
+        if start_epoch != restored_epoch:
+            print(
+                "Adjusted resumed epoch to match completed train steps "
+                f"({restored_epoch + 1} -> {start_epoch + 1}).",
+                flush=True,
+            )
+        if resume_skip_train_steps > 0:
+            print(
+                f"Skipping {resume_skip_train_steps} already-completed train batch(es) in resumed epoch.",
+                flush=True,
+            )
+
     print(
         f"Starting training on {len(train_dataset):,} train samples"
         + (f" + {len(val_dataset):,} val samples" if val_dataset is not None else "")
@@ -2393,6 +4315,12 @@ def train_projector(
     )
     if target_family == "sdxl":
         print(f"SDXL projector architecture: {sdxl_projector_arch}")
+    if standardization_config.enabled:
+        print(
+            "Embedding standardization: enabled | "
+            f"eps={standardization_config.eps:.1e} | "
+            f"threads={standardization_config.threads}",
+        )
     print(
         f"Optimizer=AdamW(max_lr={max_lr}, weight_decay={weight_decay}) | "
         f"hidden_dim={hidden_dim} | val_split={val_fraction:.2f} | grad_clip={grad_clip}"
@@ -2440,145 +4368,201 @@ def train_projector(
         flush=True,
     )
     model.train()
-    global_step = 0
-    best_metric = float("inf")
-    best_epoch = 0
+    try:
+        for epoch in range(start_epoch, epochs):
+            if max_steps > 0 and global_step >= max_steps:
+                break
+            metric_sums = _init_metric_sums(target_family, device)
+            steps_this_epoch = 0
+            rows_done = 0
+            pass_start = perf_counter()
+            last_emit_s = pass_start
+            for batch_idx, (batch_qwen, batch_target) in enumerate(train_dataloader):
+                if batch_idx < resume_skip_train_steps:
+                    continue
+                batch_qwen = _move_qwen_bundle_to_device(batch_qwen, device, pin_memory)
+                batch_target = _move_target_bundle_to_device(
+                    batch_target, device, pin_memory
+                )
 
-    for epoch in range(epochs):
-        metric_sums = _init_metric_sums(target_family, device)
-        steps_this_epoch = 0
-        rows_done = 0
-        pass_start = perf_counter()
-        last_emit_s = pass_start
-        for batch_qwen, batch_target in train_dataloader:
-            batch_qwen = batch_qwen.to(device, non_blocking=pin_memory)
-            batch_target = _move_target_bundle_to_device(
-                batch_target, device, pin_memory
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=amp_enabled,
+                ):
+                    predictions = _forward_qwen_model(model, batch_qwen)
+                    loss, batch_metrics = _compute_loss_metrics(
+                        predictions,
+                        batch_target,
+                        target_family,
+                        criterion,
+                        prompt_loss_weight=prompt_loss_weight,
+                        pooled_loss_weight=pooled_loss_weight,
+                        sdxl_loss_config=sdxl_loss_config,
+                    )
+
+                if amp_enabled:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                _accumulate_metric_sums(metric_sums, batch_metrics)
+                steps_this_epoch += 1
+                global_step += 1
+                rows_done += _bundle_batch_size(batch_target)
+
+                if _should_emit_progress(
+                    steps_this_epoch, last_emit_s, progress_every, progress_seconds
+                ):
+                    elapsed_s = max(perf_counter() - pass_start, 1e-6)
+                    avg_metrics = _finalize_metric_sums(metric_sums, steps_this_epoch)
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "split": "train",
+                            "epoch": epoch + 1,
+                            "epochs": epochs,
+                            "step": steps_this_epoch,
+                            "total_steps": len(train_dataloader),
+                            "rows": rows_done,
+                            "total_rows": len(train_dataset),
+                            **avg_metrics,
+                            "rows_per_s": rows_done / elapsed_s,
+                            "lr": optimizer.param_groups[0]["lr"],
+                        },
+                    )
+                    last_emit_s = perf_counter()
+
+                if max_steps > 0 and global_step >= max_steps:
+                    break
+            resume_skip_train_steps = 0
+
+            train_metrics = _finalize_metric_sums(metric_sums, steps_this_epoch)
+            val_metrics = _evaluate(
+                model,
+                val_dataloader,
+                criterion,
+                target_family,
+                device,
+                amp_enabled,
+                pin_memory,
+                epoch_num=epoch + 1,
+                epochs=epochs,
+                current_lr=optimizer.param_groups[0]["lr"],
+                progress_every=progress_every,
+                progress_seconds=progress_seconds,
+                progress_callback=progress_callback,
+                prompt_loss_weight=prompt_loss_weight,
+                pooled_loss_weight=pooled_loss_weight,
+                sdxl_loss_config=sdxl_loss_config,
             )
+            current_lr = optimizer.param_groups[0]["lr"]
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=amp_enabled,
-            ):
-                predictions = model(batch_qwen)
-                loss, batch_metrics = _compute_loss_metrics(
-                    predictions,
-                    batch_target,
-                    target_family,
-                    criterion,
-                    prompt_loss_weight=prompt_loss_weight,
-                    pooled_loss_weight=pooled_loss_weight,
-                    sdxl_loss_config=sdxl_loss_config,
+            monitor_source_metrics = (
+                train_metrics if val_metrics is None else val_metrics
+            )
+            monitor_value, monitor_name = _compute_monitor_metric(
+                target_family,
+                monitor_source_metrics,
+                sdxl_monitor_config,
+            )
+            monitor_source_metrics["monitor"] = monitor_value
+            monitor_source_metrics["monitor_name"] = monitor_name
+            _save_resume_checkpoint(
+                resume_checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_epoch=best_epoch,
+                best_metric_name=best_metric_name,
+                best_metric=best_metric,
+                input_dim=dataset.input_dim,
+                target_dim=dataset.target_dim,
+                hidden_dim=hidden_dim,
+            )
+            if monitor_value < best_metric:
+                best_metric = monitor_value
+                best_epoch = epoch + 1
+                best_metric_name = monitor_name
+                _save_best_checkpoint(
+                    model,
+                    best_checkpoint_path,
+                    best_epoch,
+                    monitor_name,
+                    best_metric,
+                    monitor_source_metrics["mse"],
+                    dataset.input_dim,
+                    dataset.target_dim,
+                    hidden_dim,
+                )
+                _save_resume_checkpoint(
+                    resume_checkpoint_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    best_epoch=best_epoch,
+                    best_metric_name=best_metric_name,
+                    best_metric=best_metric,
+                    input_dim=dataset.input_dim,
+                    target_dim=dataset.target_dim,
+                    hidden_dim=hidden_dim,
                 )
 
-            if amp_enabled:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-
-            if scheduler is not None:
-                scheduler.step()
-
-            _accumulate_metric_sums(metric_sums, batch_metrics)
-            steps_this_epoch += 1
-            global_step += 1
-            rows_done += _bundle_batch_size(batch_target)
-
-            if _should_emit_progress(
-                steps_this_epoch, last_emit_s, progress_every, progress_seconds
-            ):
-                elapsed_s = max(perf_counter() - pass_start, 1e-6)
-                avg_metrics = _finalize_metric_sums(metric_sums, steps_this_epoch)
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "split": "train",
-                        "epoch": epoch + 1,
-                        "epochs": epochs,
-                        "step": steps_this_epoch,
-                        "total_steps": len(train_dataloader),
-                        "rows": rows_done,
-                        "total_rows": len(train_dataset),
-                        **avg_metrics,
-                        "rows_per_s": rows_done / elapsed_s,
-                        "lr": optimizer.param_groups[0]["lr"],
-                    },
+            should_log = (
+                (epoch + 1) % 10 == 0
+                or epoch == start_epoch
+                or (max_steps > 0 and global_step >= max_steps)
+            )
+            if should_log:
+                log_line = f"Epoch {epoch+1}/{epochs} | " + _format_epoch_metrics(
+                    "train_", train_metrics
                 )
-                last_emit_s = perf_counter()
+                if val_metrics is not None:
+                    log_line += " | " + _format_epoch_metrics("val_", val_metrics)
+                log_line += f" | lr={current_lr:.6e}"
+                print(log_line)
 
             if max_steps > 0 and global_step >= max_steps:
                 break
-
-        train_metrics = _finalize_metric_sums(metric_sums, steps_this_epoch)
-        val_metrics = _evaluate(
+    except KeyboardInterrupt as exc:
+        saved_path = _save_resume_checkpoint(
+            resume_checkpoint_path,
             model,
-            val_dataloader,
-            criterion,
-            target_family,
-            device,
-            amp_enabled,
-            pin_memory,
-            epoch_num=epoch + 1,
-            epochs=epochs,
-            current_lr=optimizer.param_groups[0]["lr"],
-            progress_every=progress_every,
-            progress_seconds=progress_seconds,
-            progress_callback=progress_callback,
-            prompt_loss_weight=prompt_loss_weight,
-            pooled_loss_weight=pooled_loss_weight,
-            sdxl_loss_config=sdxl_loss_config,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch=epoch,
+            global_step=global_step,
+            best_epoch=best_epoch,
+            best_metric_name=best_metric_name,
+            best_metric=best_metric,
+            input_dim=dataset.input_dim,
+            target_dim=dataset.target_dim,
+            hidden_dim=hidden_dim,
         )
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        monitor_source_metrics = train_metrics if val_metrics is None else val_metrics
-        monitor_value, monitor_name = _compute_monitor_metric(
-            target_family,
-            monitor_source_metrics,
-            sdxl_monitor_config,
+        print(
+            f"Interrupted training. Progress saved to {saved_path}. Re-run to resume.",
+            flush=True,
         )
-        monitor_source_metrics["monitor"] = monitor_value
-        monitor_source_metrics["monitor_name"] = monitor_name
-        if monitor_value < best_metric:
-            best_metric = monitor_value
-            best_epoch = epoch + 1
-            _save_best_checkpoint(
-                model,
-                best_checkpoint_path,
-                best_epoch,
-                monitor_name,
-                best_metric,
-                monitor_source_metrics["mse"],
-                dataset.input_dim,
-                dataset.target_dim,
-                hidden_dim,
-            )
-
-        should_log = (
-            (epoch + 1) % 10 == 0
-            or epoch == 0
-            or (max_steps > 0 and global_step >= max_steps)
-        )
-        if should_log:
-            log_line = f"Epoch {epoch+1}/{epochs} | " + _format_epoch_metrics(
-                "train_", train_metrics
-            )
-            if val_metrics is not None:
-                log_line += " | " + _format_epoch_metrics("val_", val_metrics)
-            log_line += f" | lr={current_lr:.6e}"
-            print(log_line)
-
-        if max_steps > 0 and global_step >= max_steps:
-            break
+        raise TrainingInterrupted(saved_path) from exc
 
     best_checkpoint = _restore_best_checkpoint(model, best_checkpoint_path, device)
     if best_checkpoint is not None:
@@ -2597,6 +4581,7 @@ def train_projector(
         )
 
     print("Training complete!")
+    _remove_resume_checkpoint(resume_checkpoint_path)
     return model
 
 
@@ -2625,6 +4610,10 @@ def load_projector_from_gguf(gguf_path, device=None):
         tensor.name: torch.from_numpy(np.array(tensor.data, copy=True)).float()
         for tensor in reader.tensors
     }
+    gguf_standardization_payload = _gguf_standardization_payload_from_tensors(
+        reader,
+        tensor_map,
+    )
 
     if target_family == "sdxl":
         state_dict_tensors = {
@@ -2975,6 +4964,13 @@ def load_projector_from_gguf(gguf_path, device=None):
             "sd_dim": sd_dim,
         }
 
+    _restore_standardization_from_payload(model, gguf_standardization_payload)
+    metadata["use_spectral_norm"] = bool(
+        int(_gguf_field_value(reader, "projector.use_spectral_norm", 0))
+    )
+    metadata["uses_embedding_standardization"] = bool(
+        getattr(model, "uses_embedding_standardization", False)
+    )
     model = model.to(device).eval()
     return model, metadata
 
@@ -2984,55 +4980,121 @@ def export_to_gguf(model, output_filename="qwen_sd_projector.gguf", target_famil
 
     print(f"\nExporting weights to {output_filename}...")
 
-    model.eval()
-    model.cpu()
-    state_dict = model.state_dict()
-    architecture = getattr(model, "architecture_name", "mlp")
+    export_model = _model_for_gguf_export(model)
+    export_model.eval()
+    export_model.cpu()
+    state_dict = export_model.state_dict()
+    architecture = getattr(export_model, "architecture_name", "mlp")
+    standardization_payload = _standardization_checkpoint_payload(export_model)
+    uses_embedding_standardization = standardization_payload is not None
+
+    def _gguf_array(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().astype(np.float32, copy=False)
+        return np.asarray(value, dtype=np.float32)
 
     writer = gguf.GGUFWriter(output_filename, "projector")
     schema_version = 2
     if target_family == "sdxl":
         schema_version = 4 if architecture == "resampler" else 3
+    if uses_embedding_standardization:
+        schema_version = max(schema_version, 5)
     writer.add_uint32("projector.schema_version", schema_version)
     writer.add_string("projector.target_family", target_family)
+    writer.add_uint32(
+        "projector.use_spectral_norm",
+        1 if getattr(model, "use_spectral_norm", False) else 0,
+    )
+    writer.add_uint32(
+        "projector.uses_embedding_standardization",
+        1 if uses_embedding_standardization else 0,
+    )
+    writer.add_uint32(
+        "projector.requires_input_standardization",
+        1 if uses_embedding_standardization else 0,
+    )
+    writer.add_uint32(
+        "projector.requires_output_denormalization",
+        1 if uses_embedding_standardization else 0,
+    )
+    if uses_embedding_standardization:
+        writer.add_tensor(
+            _gguf_standardization_tensor_name("qwen", "mean"),
+            _gguf_array(standardization_payload["qwen_mean"]),
+        )
+        writer.add_tensor(
+            _gguf_standardization_tensor_name("qwen", "std"),
+            _gguf_array(standardization_payload["qwen_std"]),
+        )
+        for key, value in standardization_payload["target_means"].items():
+            writer.add_tensor(
+                _gguf_standardization_tensor_name(key, "mean"),
+                _gguf_array(value),
+            )
+        for key, value in standardization_payload["target_stds"].items():
+            writer.add_tensor(
+                _gguf_standardization_tensor_name(key, "std"),
+                _gguf_array(value),
+            )
 
     if target_family == "sdxl":
         writer.add_string("projector.architecture", architecture)
-        writer.add_uint32("projector.qwen_dim", int(model.qwen_dim))
-        writer.add_uint32("projector.hidden_dim", int(model.hidden_dim))
-        writer.add_uint32("projector.prompt_seq_len", int(model.prompt_seq_len))
-        writer.add_uint32("projector.prompt_dim", int(model.prompt_dim))
-        writer.add_uint32("projector.pooled_dim", int(model.pooled_dim))
+        writer.add_uint32("projector.qwen_dim", int(export_model.qwen_dim))
+        writer.add_uint32("projector.hidden_dim", int(export_model.hidden_dim))
+        writer.add_uint32("projector.prompt_seq_len", int(export_model.prompt_seq_len))
+        writer.add_uint32("projector.prompt_dim", int(export_model.prompt_dim))
+        writer.add_uint32("projector.pooled_dim", int(export_model.pooled_dim))
         writer.add_string(
             "projector.output_mode",
-            "calibrated" if getattr(model, "use_output_calibrator", False) else "plain",
+            (
+                "calibrated"
+                if getattr(export_model, "use_output_calibrator", False)
+                else "plain"
+            ),
         )
         writer.add_uint32(
             "projector.use_output_calibrator",
-            1 if getattr(model, "use_output_calibrator", False) else 0,
+            1 if getattr(export_model, "use_output_calibrator", False) else 0,
         )
         writer.add_uint32(
-            "projector.prompt_head_hidden_dim", int(model.prompt_head_hidden_dim)
+            "projector.prompt_head_hidden_dim",
+            int(export_model.prompt_head_hidden_dim),
         )
         writer.add_uint32(
-            "projector.pooled_head_hidden_dim", int(model.pooled_head_hidden_dim)
+            "projector.pooled_head_hidden_dim",
+            int(export_model.pooled_head_hidden_dim),
         )
         if architecture == "resampler":
-            writer.add_uint32("projector.resampler_depth", int(model.resampler_depth))
-            writer.add_uint32("projector.resampler_heads", int(model.resampler_heads))
-            writer.add_uint32("projector.resampler_ff_dim", int(model.resampler_ff_dim))
+            writer.add_uint32(
+                "projector.resampler_depth", int(export_model.resampler_depth)
+            )
+            writer.add_uint32(
+                "projector.resampler_heads", int(export_model.resampler_heads)
+            )
+            writer.add_uint32(
+                "projector.resampler_ff_dim", int(export_model.resampler_ff_dim)
+            )
             writer.add_uint32(
                 "projector.resampler_ff_mult",
-                int(max(model.resampler_ff_dim // max(model.hidden_dim, 1), 1)),
+                int(
+                    max(
+                        export_model.resampler_ff_dim
+                        // max(export_model.hidden_dim, 1),
+                        1,
+                    )
+                ),
             )
             writer.add_uint32(
-                "projector.pooled_query_count", int(model.pooled_query_count)
+                "projector.pooled_query_count", int(export_model.pooled_query_count)
             )
         else:
-            writer.add_uint32("projector.prompt_token_dim", int(model.prompt_token_dim))
-            writer.add_uint32("projector.trunk_depth", int(model.trunk_depth))
             writer.add_uint32(
-                "projector.residual_trunk", 1 if model.residual_trunk else 0
+                "projector.prompt_token_dim", int(export_model.prompt_token_dim)
+            )
+            writer.add_uint32("projector.trunk_depth", int(export_model.trunk_depth))
+            writer.add_uint32(
+                "projector.residual_trunk",
+                1 if export_model.residual_trunk else 0,
             )
         for name, tensor in state_dict.items():
             writer.add_tensor(f"state_dict.{name}", tensor.numpy())
@@ -3081,14 +5143,18 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(f"Using archives: {QWEN_ARCHIVE_DIR} + {resolved_target_dir}")
-    trained_model = train_projector(
-        use_archives=True,
-        archive_root=OUTPUT_DIR,
-        qwen_archive_root=QWEN_OUTPUT_DIR,
-        target_family=target_family,
-    )
-    export_to_gguf(
-        trained_model,
-        gguf_output_path,
-        target_family=target_family,
-    )
+    try:
+        trained_model = train_projector(
+            use_archives=True,
+            archive_root=OUTPUT_DIR,
+            qwen_archive_root=QWEN_OUTPUT_DIR,
+            target_family=target_family,
+        )
+        export_to_gguf(
+            trained_model,
+            gguf_output_path,
+            target_family=target_family,
+        )
+    except TrainingInterrupted as exc:
+        print(exc)
+        raise SystemExit(130)

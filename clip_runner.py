@@ -2,6 +2,7 @@ import json
 import os
 from collections import deque
 from contextlib import suppress
+from dataclasses import replace
 from time import perf_counter
 
 # RDNA4 (gfx1200) can require an explicit override on ROCm so PyTorch builds
@@ -62,6 +63,7 @@ CLIP_ARCHIVE_DIR = os.path.join(TARGET_OUTPUT_DIR, "clip_archive")
 CLIP_ARCHIVE_EVERY = int(os.getenv("CLIP_ARCHIVE_EVERY", "250000"))
 CLIP_CHECKPOINT_DELTA = os.path.join(TARGET_OUTPUT_DIR, "clip_checkpoint_delta.parquet")
 CLIP_CHECKPOINT_DELTA_TMP = CLIP_CHECKPOINT_DELTA + ".tmp"
+DEFAULT_SDXL_CLIP_ARCHIVE_EVERY = 25 * 128
 SDXL_CLIP_ARCHIVE_EVERY = int(os.getenv("SDXL_CLIP_ARCHIVE_EVERY", "0"))
 
 # LongCLIP-L: extends CLIP ViT-L/14 context from 77 to 248 tokens.
@@ -180,6 +182,22 @@ def _target_archive_dtype_name(target_family: str) -> str:
     if target_family == "sdxl":
         return SDXL_TARGET_DTYPE
     return "float32"
+
+
+def _clip_target_layout(output_dir: str, target_family: str):
+    layout = get_target_layout(output_dir, target_family)
+    if target_family != "sdxl":
+        return layout
+    return replace(
+        layout,
+        root_dir=output_dir,
+        archive_dir=output_dir,
+        checkpoint_delta_path=os.path.join(output_dir, "checkpoint_delta.npz"),
+        checkpoint_delta_tmp_path=os.path.join(output_dir, "checkpoint_delta.npz.tmp"),
+        errors_path=os.path.join(output_dir, "errors.parquet"),
+        errors_tmp_path=os.path.join(output_dir, "errors.parquet.tmp"),
+        manifest_path=os.path.join(output_dir, "manifest.json"),
+    )
 
 
 def _log_gpu_runtime(device):
@@ -390,7 +408,7 @@ def _archive_every(target_family: str) -> int:
     if target_family == "sdxl":
         if SDXL_CLIP_ARCHIVE_EVERY > 0:
             return SDXL_CLIP_ARCHIVE_EVERY
-        return BATCH_SIZE
+        return DEFAULT_SDXL_CLIP_ARCHIVE_EVERY
     return CLIP_ARCHIVE_EVERY
 
 
@@ -1041,7 +1059,7 @@ def process_clip():
     prompt_column = _requested_prompt_column()
     checkpoint_every = _checkpoint_every(target_family)
     archive_every = _archive_every(target_family)
-    target_layout = get_target_layout(TARGET_OUTPUT_DIR, target_family)
+    target_layout = _clip_target_layout(TARGET_OUTPUT_DIR, target_family)
     ensure_target_root(target_layout)
     write_target_manifest(
         target_layout.manifest_path,
